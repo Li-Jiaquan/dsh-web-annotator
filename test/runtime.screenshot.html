@@ -1,0 +1,903 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>DSH Web Annotator — screenshot test page</title>
+    <!-- Cross-origin stylesheet: served by the second test server. -->
+    <link rel="stylesheet" href="__CROSS_ORIGIN__/cross.css" />
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+      }
+      body {
+        background: #ffffff;
+        color: #1f2937;
+        font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      }
+      .row {
+        padding: 8px 20px;
+      }
+      #green-box {
+        width: 240px;
+        height: 120px;
+        background: rgb(0, 200, 80);
+      }
+      #cross-img {
+        display: block;
+        width: 200px;
+        height: 100px;
+      }
+      #cross-css-box {
+        width: 200px;
+        height: 80px;
+      }
+    </style>
+    <script>
+      /*
+       * Screenshot e2e harness (SPEC §10.3).
+       *
+       * The page is served by the host-like test server; the runtime itself is
+       * loaded from /runtime.js. This harness behaves like client.js: it
+       * registers annotations through `set-annotations`, then drives
+       * `capture-screenshots` and validates the `screenshots` answer (order,
+       * requestId, crop geometry, PNG pixels, failure paths). Everything is
+       * written into data-test-* attributes so `--dump-dom` can assert it.
+       */
+      (function () {
+        'use strict';
+
+        /*
+         * Regression (real-world): pages with an AMD loader (e.g. baidu.com)
+         * make the UMD html2canvas register as an AMD module instead of setting
+         * window.html2canvas. The runtime must still obtain a factory through
+         * its fetch+eval path and capture must succeed.
+         */
+        window.define = function () {
+          /* AMD sink: swallow the module factory */
+        };
+        window.define.amd = true;
+        var htmlEl = document.documentElement;
+        var errors = [];
+        var seen = [];
+        var messages = [];
+        var waiters = [];
+        var state = { started: false, done: false };
+        var pending = Object.create(null);
+        var watchdog = setTimeout(function () {
+          fail('timeout', 'harness did not finish');
+        }, 55000);
+
+        function set(name, value) {
+          try {
+            htmlEl.setAttribute('data-test-' + name, String(value));
+          } catch (error) {
+            /* ignore */
+          }
+        }
+
+        function pass() {
+          if (state.done) return;
+          state.done = true;
+          clearTimeout(watchdog);
+          set('status', 'pass');
+        }
+
+        function fail(step, detail) {
+          if (state.done) return;
+          state.done = true;
+          clearTimeout(watchdog);
+          set('status', 'fail');
+          set('failed-step', step + (detail ? ':' + detail : ''));
+        }
+
+        function assert(name, ok, detail) {
+          set(name, ok ? '1' : '0');
+          if (!ok) throw new Error(name + (detail ? ':' + detail : ''));
+        }
+
+        function wait(ms) {
+          return new Promise(function (resolve) {
+            setTimeout(resolve, ms);
+          });
+        }
+
+        /* v1.5: generic message wait + overlay/event helpers for navigation tests. */
+        function waitForMessage(type, predicate, timeoutMs) {
+          return new Promise(function (resolve) {
+            for (var index = 0; index < messages.length; index += 1) {
+              var existing = messages[index];
+              if (existing.type !== type) continue;
+              if (predicate && !predicate(existing)) continue;
+              resolve(existing);
+              return;
+            }
+            var waiter = { type: type, predicate: predicate, resolve: resolve, timer: 0 };
+            waiter.timer = setTimeout(function () {
+              var position = waiters.indexOf(waiter);
+              if (position >= 0) waiters.splice(position, 1);
+              resolve(null);
+            }, timeoutMs || 1500);
+            waiters.push(waiter);
+          });
+        }
+
+        function shadowQ(selector) {
+          var host = document.getElementById('dsh-web-annotator-root');
+          return host && host.shadowRoot ? host.shadowRoot.querySelector(selector) : null;
+        }
+
+        function pointerOn(target, type, x, y) {
+          if (!target) return false;
+          try {
+            target.dispatchEvent(
+              new PointerEvent(type, {
+                bubbles: true,
+                composed: true,
+                cancelable: true,
+                clientX: x,
+                clientY: y,
+                pointerId: 11,
+                pointerType: 'mouse',
+                isPrimary: true,
+                button: 0,
+                buttons: type === 'pointerup' ? 0 : 1
+              })
+            );
+            return true;
+          } catch (error) {
+            return false;
+          }
+        }
+
+        function pressSpace(down) {
+          try {
+            document.dispatchEvent(
+              new KeyboardEvent(down ? 'keydown' : 'keyup', {
+                code: 'Space',
+                key: ' ',
+                bubbles: true,
+                composed: true,
+                cancelable: true
+              })
+            );
+          } catch (error) {
+            /* ignore */
+          }
+        }
+
+        /* Wait for a message that arrives AFTER `fromIndex` (avoids matching history). */
+        function waitForNewMessage(type, predicate, fromIndex, timeoutMs) {
+          var deadline = Date.now() + (timeoutMs || 1500);
+          return new Promise(function (resolve) {
+            function poll() {
+              for (var index = Math.max(0, fromIndex || 0); index < messages.length; index += 1) {
+                var entry = messages[index];
+                if (entry.type !== type) continue;
+                if (predicate && !predicate(entry)) continue;
+                resolve(entry);
+                return;
+              }
+              if (Date.now() > deadline) {
+                resolve(null);
+                return;
+              }
+              setTimeout(poll, 20);
+            }
+            poll();
+          });
+        }
+
+        function capture(requestId, ids, options) {
+          return new Promise(function (resolve) {
+            var timer = setTimeout(function () {
+              delete pending[requestId];
+              resolve(null);
+            }, 40000);
+            pending[requestId] = function (data) {
+              clearTimeout(timer);
+              resolve(data);
+            };
+            var message = { channel: 'dsh-web-annotator', type: 'capture-screenshots', requestId: requestId, ids: ids };
+            if (options) message.options = options;
+            window.postMessage(message, '*');
+          });
+        }
+
+        window.addEventListener('message', function (event) {
+          var data = event.data;
+          if (!data || data.channel !== 'dsh-web-annotator') return;
+          seen.push(data.type);
+          messages.push(data);
+          set('seen', seen.join(','));
+          for (var waiterIndex = waiters.length - 1; waiterIndex >= 0; waiterIndex -= 1) {
+            var pendingWaiter = waiters[waiterIndex];
+            if (pendingWaiter.type !== data.type) continue;
+            if (pendingWaiter.predicate && !pendingWaiter.predicate(data)) continue;
+            clearTimeout(pendingWaiter.timer);
+            waiters.splice(waiterIndex, 1);
+            pendingWaiter.resolve(data);
+          }
+          if (data.type === 'ready') {
+            set('ready', '1');
+            if (!state.started) {
+              state.started = true;
+              run().catch(function (error) {
+                fail('run', (error && error.message) || String(error));
+              });
+            }
+            return;
+          }
+          if (data.type === 'screenshots') {
+            var resolve = pending[data.requestId];
+            if (resolve) {
+              delete pending[data.requestId];
+              resolve(data);
+            }
+            return;
+          }
+          if (data.type === 'error') {
+            errors.push(String((data.payload && data.payload.message) || ''));
+            set('runtime-errors', errors.join(' | '));
+          }
+        });
+
+        window.addEventListener('error', function (event) {
+          errors.push('window:' + String((event && event.message) || ''));
+          set('runtime-errors', errors.join(' | '));
+        });
+
+        function pageRect(element) {
+          var rect = element.getBoundingClientRect();
+          var sx = window.scrollX || window.pageXOffset || 0;
+          var sy = window.scrollY || window.pageYOffset || 0;
+          return {
+            x: Math.round(rect.left + sx),
+            y: Math.round(rect.top + sy),
+            width: Math.round(rect.width),
+            height: Math.round(rect.height)
+          };
+        }
+
+        /** Decode a PNG dataURL and read its center pixel (non-blank proof). */
+        function sampleCenter(dataUrl) {
+          return new Promise(function (resolve) {
+            try {
+              var image = new Image();
+              image.onload = function () {
+                try {
+                  var canvas = document.createElement('canvas');
+                  canvas.width = image.naturalWidth || image.width;
+                  canvas.height = image.naturalHeight || image.height;
+                  var context = canvas.getContext('2d');
+                  context.drawImage(image, 0, 0);
+                  var data = context.getImageData(Math.floor(canvas.width / 2), Math.floor(canvas.height / 2), 1, 1).data;
+                  resolve([data[0], data[1], data[2], data[3]]);
+                } catch (error) {
+                  resolve(null);
+                }
+              };
+              image.onerror = function () {
+                resolve(null);
+              };
+              image.src = dataUrl;
+            } catch (error) {
+              resolve(null);
+            }
+          });
+        }
+
+        function isClose(pixel, expected, tolerance) {
+          if (!pixel) return false;
+          return (
+            Math.abs(pixel[0] - expected[0]) <= tolerance &&
+            Math.abs(pixel[1] - expected[1]) <= tolerance &&
+            Math.abs(pixel[2] - expected[2]) <= tolerance
+          );
+        }
+
+        /** Decode a PNG dataURL into a canvas (for pixel-level v1.3 assertions). */
+        function decodeToCanvas(dataUrl) {
+          return new Promise(function (resolve) {
+            try {
+              var image = new Image();
+              image.onload = function () {
+                try {
+                  var canvas = document.createElement('canvas');
+                  canvas.width = image.naturalWidth || image.width;
+                  canvas.height = image.naturalHeight || image.height;
+                  var ctx = canvas.getContext('2d');
+                  ctx.drawImage(image, 0, 0);
+                  resolve(canvas);
+                } catch (error) {
+                  resolve(null);
+                }
+              };
+              image.onerror = function () {
+                resolve(null);
+              };
+              image.src = dataUrl;
+            } catch (error) {
+              resolve(null);
+            }
+          });
+        }
+
+        function pixelAt(canvas, x, y) {
+          if (!canvas) return null;
+          try {
+            var ctx = canvas.getContext('2d');
+            var data = ctx.getImageData(Math.max(0, Math.round(x)), Math.max(0, Math.round(y)), 1, 1).data;
+            return [data[0], data[1], data[2], data[3]];
+          } catch (error) {
+            return null;
+          }
+        }
+
+        function countPixels(canvas, x, y, width, height, predicate) {
+          if (!canvas) return 0;
+          try {
+            var ctx = canvas.getContext('2d');
+            var left = Math.max(0, Math.floor(x));
+            var top = Math.max(0, Math.floor(y));
+            var w = Math.min(canvas.width - left, Math.max(0, Math.ceil(width)));
+            var h = Math.min(canvas.height - top, Math.max(0, Math.ceil(height)));
+            if (w <= 0 || h <= 0) return 0;
+            var data = ctx.getImageData(left, top, w, h).data;
+            var count = 0;
+            for (var i = 0; i < data.length; i += 4) {
+              if (predicate(data[i], data[i + 1], data[i + 2], data[i + 3])) count += 1;
+            }
+            return count;
+          } catch (error) {
+            return 0;
+          }
+        }
+
+        function bytesOf(dataUrl) {
+          if (typeof dataUrl !== 'string') return 0;
+          var comma = dataUrl.indexOf(',');
+          if (comma < 0) return dataUrl.length;
+          return Math.floor(((dataUrl.length - comma - 1) * 3) / 4);
+        }
+
+        async function run() {
+          var root = document.getElementById('dsh-web-annotator-root');
+          assert('overlay-root', !!root, 'missing runtime overlay');
+
+          if (window.location.search.indexOf('novendor') >= 0) {
+            await runNoVendor(root);
+            return;
+          }
+
+          if (window.location.search.indexOf('tall') >= 0) {
+            await runTall(root);
+            return;
+          }
+
+          if (window.location.search.indexOf('meta') >= 0) {
+            await runReadyUrl(root, 'meta');
+            return;
+          }
+
+          if (window.location.search.indexOf('readyquery') >= 0) {
+            await runReadyUrl(root, 'query');
+            return;
+          }
+
+          var green = pageRect(document.getElementById('green-box'));
+          var image = pageRect(document.getElementById('cross-img'));
+          var crossCss = pageRect(document.getElementById('cross-css-box'));
+          var pageWidth = Math.max(1, Math.ceil(document.documentElement.scrollWidth));
+          var pageHeight = Math.max(1, Math.ceil(document.documentElement.scrollHeight));
+          set('page-size', pageWidth + 'x' + pageHeight);
+
+          function expected(rect) {
+            var pad = 12;
+            var left = Math.max(0, Math.min(pageWidth, rect.x - pad));
+            var top = Math.max(0, Math.min(pageHeight, rect.y - pad));
+            var right = Math.max(0, Math.min(pageWidth, rect.x + rect.width + pad));
+            var bottom = Math.max(0, Math.min(pageHeight, rect.y + rect.height + pad));
+            return { width: Math.round(right - left), height: Math.round(bottom - top) };
+          }
+
+          var annotations = [
+            { id: 'green', number: 1, kind: 'element', rect: green },
+            { id: 'img', number: 2, kind: 'element', rect: image },
+            { id: 'crosscss', number: 3, kind: 'element', rect: crossCss },
+            { id: 'empty', number: 4, kind: 'element', rect: { x: 0, y: 0, width: 0, height: 0 } },
+            { id: 'offpage', number: 5, kind: 'element', rect: { x: 5000, y: 5000, width: 100, height: 100 } }
+          ];
+          for (var extra = 1; extra <= 13; extra += 1) {
+            annotations.push({ id: 'm' + extra, number: 100 + extra, kind: 'region', rect: green });
+          }
+          window.postMessage(
+            { channel: 'dsh-web-annotator', type: 'set-annotations', payload: { annotations: annotations } },
+            '*'
+          );
+          await wait(40);
+
+          /* ---- 1. three crops: element color, cross-origin image, cross-origin CSS ---- */
+          var shot1 = await capture('req-1', ['green', 'img', 'crosscss'], { mode: 'crop' });
+          assert('shot1-received', !!shot1, 'no screenshots message');
+          assert('shot1-request-id-echo', shot1.requestId === 'req-1', String(shot1.requestId));
+          assert('shot1-items', Array.isArray(shot1.items) && shot1.items.length === 3, 'items=' + (shot1.items || []).length);
+          assert('shot1-failed-empty', Array.isArray(shot1.failed) && shot1.failed.length === 0, JSON.stringify(shot1.failed));
+          var shot1Ids = shot1.items.map(function (item) {
+            return item.id;
+          });
+          assert('shot1-order', shot1Ids.join(',') === 'green,img,crosscss', shot1Ids.join(','));
+
+          var expectedCrops = [expected(green), expected(image), expected(crossCss)];
+          var dims = [];
+          var pixels = [];
+          for (var index = 0; index < shot1.items.length; index += 1) {
+            var item = shot1.items[index];
+            dims.push(item.width + 'x' + item.height);
+            assert(
+              'shot1-' + item.id + '-png',
+              typeof item.dataUrl === 'string' && item.dataUrl.indexOf('data:image/png;base64,') === 0,
+              'not a PNG dataURL'
+            );
+            assert(
+              'shot1-' + item.id + '-dims',
+              item.width === expectedCrops[index].width && item.height === expectedCrops[index].height,
+              item.width + 'x' + item.height + ' expected ' + expectedCrops[index].width + 'x' + expectedCrops[index].height
+            );
+            var pixel = await sampleCenter(item.dataUrl);
+            pixels.push(pixel);
+            assert('shot1-' + item.id + '-alpha', !!pixel && pixel[3] === 255, pixel ? 'alpha=' + pixel[3] : 'no pixel');
+          }
+          set('shot1-dims', dims.join(' '));
+          set(
+            'shot1-pixels',
+            pixels
+              .map(function (pixel) {
+                return pixel ? pixel.slice(0, 3).join(',') : 'none';
+              })
+              .join('|')
+          );
+          assert('shot1-green-color', isClose(pixels[0], [0, 200, 80], 40), String(pixels[0]));
+          assert(
+            'shot1-img-color',
+            !!pixels[1] && pixels[1][0] > 200 && pixels[1][1] < 60 && pixels[1][2] < 60,
+            String(pixels[1])
+          );
+          assert(
+            'shot1-crosscss-color',
+            !!pixels[2] && pixels[2][2] > 200 && pixels[2][0] < 80 && pixels[2][1] > 80 && pixels[2][1] < 180,
+            String(pixels[2])
+          );
+          assert(
+            'shot1-nonblank',
+            pixels.every(function (pixel) {
+              return !!pixel && pixel[3] === 255;
+            }),
+            'blank crop'
+          );
+
+          /* ---- 2. failure paths: unknown id, empty rect, rect outside the page ---- */
+          var shot2 = await capture('req-2', ['green', 'unknown-id', 'empty', 'offpage'], { mode: 'crop' });
+          assert('shot2-received', !!shot2, 'no screenshots message');
+          assert('shot2-request-id-echo', shot2.requestId === 'req-2', String(shot2.requestId));
+          assert(
+            'shot2-items',
+            Array.isArray(shot2.items) && shot2.items.length === 1 && shot2.items[0].id === 'green',
+            'items=' + JSON.stringify((shot2.items || []).map(function (item) { return item.id; }))
+          );
+          var failedIds = (shot2.failed || []).map(function (entry) {
+            return entry.id;
+          });
+          assert('shot2-failed-order', failedIds.join(',') === 'unknown-id,empty,offpage', failedIds.join(','));
+          assert(
+            'shot2-failed-errors',
+            (shot2.failed || []).every(function (entry) {
+              return typeof entry.error === 'string' && entry.error !== '';
+            }),
+            JSON.stringify(shot2.failed)
+          );
+          set(
+            'shot2-failed',
+            (shot2.failed || [])
+              .map(function (entry) {
+                return entry.id + ':' + entry.error;
+              })
+              .join(',')
+          );
+
+          /* ---- 3. at most 12 images, ids order preserved, 13th in failed ---- */
+          var ids13 = [];
+          for (var count = 1; count <= 13; count += 1) ids13.push('m' + count);
+          var shot3 = await capture('req-3', ids13, { mode: 'crop' });
+          assert('shot3-received', !!shot3, 'no screenshots message');
+          assert('shot3-max-items', shot3.items.length === 12, 'items=' + shot3.items.length);
+          var ids3 = shot3.items.map(function (item) {
+            return item.id;
+          });
+          assert('shot3-order', ids3.join(',') === ids13.slice(0, 12).join(','), ids3.join(','));
+          assert(
+            'shot3-extra-failed',
+            shot3.failed.length === 1 &&
+              shot3.failed[0].id === 'm13' &&
+              /max/i.test(String(shot3.failed[0].error || '')),
+            JSON.stringify(shot3.failed)
+          );
+          set('shot3-item-count', shot3.items.length);
+
+          /* ---- 4. options.maxWidth / maxHeight downsampling ---- */
+          var shot4 = await capture('req-4', ['green'], { mode: 'crop', maxWidth: 100, maxHeight: 100 });
+          assert('shot4-received', !!shot4, 'no screenshots message');
+          var item4 = shot4.items && shot4.items[0];
+          assert(
+            'shot4-dims',
+            !!item4 && item4.width > 0 && item4.height > 0 && item4.width <= 100 && item4.height <= 100,
+            item4 ? item4.width + 'x' + item4.height : 'none'
+          );
+          set('shot4-size', item4 ? item4.width + 'x' + item4.height : 'none');
+          var ratio = item4 ? item4.width / item4.height : 0;
+          var cropGreen = expected(green);
+          var expectedRatio = cropGreen.width / cropGreen.height;
+          assert('shot4-aspect', !!item4 && Math.abs(ratio - expectedRatio) < 0.05, ratio + ' vs ' + expectedRatio);
+
+          /* ---- 5. concurrent requests are serialized and both answered ---- */
+          var concurrentA = capture('req-5', ['green'], { mode: 'crop' });
+          var concurrentB = capture('req-6', ['img'], { mode: 'crop' });
+          var concurrentResults = await Promise.all([concurrentA, concurrentB]);
+          var shot5 = concurrentResults[0];
+          var shot6 = concurrentResults[1];
+          assert('shot5-received', !!shot5 && !!shot6, 'concurrent capture answer missing');
+          assert(
+            'shot5-request-ids',
+            shot5.requestId === 'req-5' && shot6.requestId === 'req-6',
+            (shot5 && shot5.requestId) + ',' + (shot6 && shot6.requestId)
+          );
+          assert(
+            'shot5-items',
+            shot5.items.length === 1 &&
+              shot5.items[0].id === 'green' &&
+              shot6.items.length === 1 &&
+              shot6.items[0].id === 'img',
+            JSON.stringify([shot5.items.map(function (item) { return item.id; }), shot6.items.map(function (item) { return item.id; })])
+          );
+
+          /* ---- 6. empty ids -> empty answer, no render needed ---- */
+          var shot7 = await capture('req-7', []);
+          assert(
+            'shot6-empty',
+            !!shot7 && Array.isArray(shot7.items) && shot7.items.length === 0 && Array.isArray(shot7.failed) && shot7.failed.length === 0,
+            JSON.stringify(shot7)
+          );
+
+          /* ---- 7. v1.3 full mode: one annotated whole-page PNG (__page__) ---- */
+          var fullShot = await capture('req-full', ['green', 'img', 'crosscss'], { mode: 'full' });
+          assert('full-received', !!fullShot, 'no screenshots message');
+          assert('full-request-id-echo', fullShot.requestId === 'req-full', String(fullShot.requestId));
+          assert('full-item-count', Array.isArray(fullShot.items) && fullShot.items.length === 1, 'items=' + (fullShot.items || []).length);
+          var fullItem = fullShot.items && fullShot.items[0];
+          assert('full-item-id', !!fullItem && fullItem.id === '__page__', fullItem ? String(fullItem.id) : 'none');
+          assert('full-failed-empty', Array.isArray(fullShot.failed) && fullShot.failed.length === 0, JSON.stringify(fullShot.failed));
+          assert(
+            'full-png',
+            !!fullItem && typeof fullItem.dataUrl === 'string' && fullItem.dataUrl.indexOf('data:image/png;base64,') === 0,
+            'not a PNG dataURL'
+          );
+          var fullBytes = fullItem ? bytesOf(fullItem.dataUrl) : 0;
+          set('full-size', fullItem ? fullItem.width + 'x' + fullItem.height : 'none');
+          set('full-bytes', fullBytes);
+          assert(
+            'full-size-page',
+            !!fullItem && fullItem.width === pageWidth && fullItem.height === pageHeight,
+            fullItem ? fullItem.width + 'x' + fullItem.height + ' vs ' + pageWidth + 'x' + pageHeight : 'none'
+          );
+          assert('full-long-edge', !!fullItem && Math.max(fullItem.width, fullItem.height) <= 2400, fullItem ? String(Math.max(fullItem.width, fullItem.height)) : '0');
+          assert('full-bytes-limit', fullBytes > 0 && fullBytes <= 3 * 1024 * 1024, String(fullBytes));
+
+          var fullCanvas = fullItem ? await decodeToCanvas(fullItem.dataUrl) : null;
+          assert('full-decoded', !!fullCanvas, 'cannot decode the full image');
+          var fullScaleX = fullCanvas ? fullCanvas.width / pageWidth : 1;
+          var fullScaleY = fullCanvas ? fullCanvas.height / pageHeight : 1;
+          var fullBorderGreen = pixelAt(fullCanvas, green.x * fullScaleX, (green.y + green.height / 2) * fullScaleY);
+          var fullBorderCss = pixelAt(fullCanvas, crossCss.x * fullScaleX, (crossCss.y + crossCss.height / 2) * fullScaleY);
+          assert('full-border-green', isClose(fullBorderGreen, [225, 29, 72], 45), String(fullBorderGreen));
+          assert('full-border-crosscss', isClose(fullBorderCss, [225, 29, 72], 45), String(fullBorderCss));
+          var fullFillGreen = pixelAt(
+            fullCanvas,
+            (green.x + green.width / 2) * fullScaleX,
+            (green.y + green.height / 2) * fullScaleY
+          );
+          assert('full-fill-green', !!fullFillGreen && fullFillGreen[1] > 140 && fullFillGreen[0] < 80, String(fullFillGreen));
+          var fullBadgeWhite = countPixels(
+            fullCanvas,
+            green.x * fullScaleX,
+            green.y * fullScaleY,
+            22 * fullScaleX,
+            22 * fullScaleY,
+            function (r, g, b, a) {
+              return a > 200 && r > 200 && g > 200 && b > 200;
+            }
+          );
+          var fullBadgeRed = countPixels(
+            fullCanvas,
+            green.x * fullScaleX,
+            green.y * fullScaleY,
+            22 * fullScaleX,
+            22 * fullScaleY,
+            function (r, g, b, a) {
+              return a > 200 && r > 100 && r < 220 && g < 70 && b < 110;
+            }
+          );
+          set('full-badge-white', fullBadgeWhite);
+          set('full-badge-red', fullBadgeRed);
+          assert('full-badge-number', fullBadgeWhite >= 2, 'white badge pixels=' + fullBadgeWhite);
+          assert('full-badge-background', fullBadgeRed >= 20, 'dark-red badge pixels=' + fullBadgeRed);
+
+          /* ---- 8. full mode: invalid ids go to failed, still one __page__ ---- */
+          var fullInvalid = await capture('req-full-invalid', ['green', 'unknown-id'], { mode: 'full' });
+          assert('full-invalid-received', !!fullInvalid, 'no screenshots message');
+          assert(
+            'full-invalid-page',
+            Array.isArray(fullInvalid.items) &&
+              fullInvalid.items.length === 1 &&
+              fullInvalid.items[0].id === '__page__',
+            JSON.stringify(
+              (fullInvalid.items || []).map(function (item) {
+                return item.id;
+              })
+            )
+          );
+          assert(
+            'full-invalid-failed',
+            Array.isArray(fullInvalid.failed) && fullInvalid.failed.length === 1 && fullInvalid.failed[0].id === 'unknown-id',
+            JSON.stringify(fullInvalid.failed)
+          );
+
+          /* ---- 9. full mode: no valid ids -> items=[], no render ---- */
+          var fullNone = await capture('req-full-none', ['unknown-id'], { mode: 'full' });
+          assert('full-none-received', !!fullNone, 'no screenshots message');
+          assert('full-none-items', Array.isArray(fullNone.items) && fullNone.items.length === 0, 'items=' + (fullNone.items || []).length);
+          assert(
+            'full-none-failed',
+            Array.isArray(fullNone.failed) && fullNone.failed.length === 1 && fullNone.failed[0].id === 'unknown-id',
+            JSON.stringify(fullNone.failed)
+          );
+
+          /* ---- 10. v1.5 navigation bridge (SPEC §14.3) ---- */
+          var relLink = document.getElementById('rel-link');
+          var extLink = document.getElementById('ext-link');
+          var hashLink = document.getElementById('hash-link');
+          var jsLink = document.getElementById('js-link');
+          assert('nav-links-present', !!relLink && !!extLink && !!hashLink && !!jsLink, 'missing test anchors');
+          var anchorClicks = 0;
+          relLink.addEventListener('click', function () {
+            anchorClicks += 1;
+          });
+          function countNavigate() {
+            var total = 0;
+            for (var navIndex = 0; navIndex < messages.length; navIndex += 1) {
+              if (messages[navIndex].type === 'navigate') total += 1;
+            }
+            return total;
+          }
+          var expectedRelative = new URL('/next', window.location.href).href;
+          var navCount0 = countNavigate();
+
+          // non-annotate click on a relative link -> navigate, default prevented
+          var relStart = messages.length;
+          var relEvent = new MouseEvent('click', { bubbles: true, composed: true, cancelable: true });
+          relLink.dispatchEvent(relEvent);
+          var relNav = await waitForNewMessage('navigate', function (data) { return data.source === 'link'; }, relStart, 2000);
+          assert('nav-relative', !!relNav && relNav.url === expectedRelative, relNav ? relNav.url : 'none');
+          assert('nav-relative-default-prevented', relEvent.defaultPrevented === true, String(relEvent.defaultPrevented));
+          assert('nav-relative-stop-immediate', anchorClicks === 0, 'anchor click listener ran');
+          set('nav-relative-url', relNav ? relNav.url : 'none');
+
+          // non-annotate click on an absolute https link
+          var extStart = messages.length;
+          var extEvent = new MouseEvent('click', { bubbles: true, composed: true, cancelable: true });
+          extLink.dispatchEvent(extEvent);
+          var extNav = await waitForNewMessage('navigate', function (data) { return data.url === 'https://example.com/x'; }, extStart, 2000);
+          assert('nav-external', !!extNav && extNav.source === 'link', extNav ? JSON.stringify(extNav) : 'none');
+          assert('nav-external-default-prevented', extEvent.defaultPrevented === true, String(extEvent.defaultPrevented));
+
+          // pure #hash and javascript: links are not intercepted
+          var hashEvent = new MouseEvent('click', { bubbles: true, composed: true, cancelable: true });
+          hashLink.dispatchEvent(hashEvent);
+          await wait(80);
+          assert('nav-hash-ignored', hashEvent.defaultPrevented === false && countNavigate() === navCount0 + 2, 'hash link was intercepted');
+          var jsEvent = new MouseEvent('click', { bubbles: true, composed: true, cancelable: true });
+          jsLink.dispatchEvent(jsEvent);
+          await wait(80);
+          assert('nav-javascript-ignored', jsEvent.defaultPrevented === false && countNavigate() === navCount0 + 2, 'javascript: link was intercepted');
+
+          // annotate mode: a link click is a selection gesture, never a navigation
+          var modeStart = messages.length;
+          window.postMessage({ channel: 'dsh-web-annotator', type: 'set-mode', payload: { active: true } }, '*');
+          var modeAck = await waitForNewMessage(
+            'mode',
+            function (data) {
+              return data.payload && data.payload.active === true;
+            },
+            modeStart,
+            2000
+          );
+          assert('nav-annotate-mode', !!modeAck, 'no mode ack');
+          await wait(60);
+          var hitLayer = shadowQ('.dsha-hit');
+          var relBox = relLink.getBoundingClientRect();
+          var navCountBeforeAnnotate = countNavigate();
+          var selectStart = messages.length;
+          pointerOn(hitLayer, 'pointerdown', relBox.left + relBox.width / 2, relBox.top + relBox.height / 2);
+          pointerOn(hitLayer, 'pointerup', relBox.left + relBox.width / 2, relBox.top + relBox.height / 2);
+          var selectMessage = await waitForNewMessage('select', null, selectStart, 2500);
+          await wait(60);
+          assert('nav-annotate-select', !!selectMessage, 'no select message in annotate mode');
+          assert('nav-annotate-no-navigate', countNavigate() === navCountBeforeAnnotate, 'annotate click sent navigate');
+
+          // Space passthrough: browsing wins, the link navigates
+          pressSpace(true);
+          await wait(70);
+          var passthroughStart = messages.length;
+          var passthroughEvent = new MouseEvent('click', { bubbles: true, composed: true, cancelable: true });
+          relLink.dispatchEvent(passthroughEvent);
+          var passthroughNav = await waitForNewMessage(
+            'navigate',
+            function (data) {
+              return data.url === expectedRelative;
+            },
+            passthroughStart,
+            2000
+          );
+          assert('nav-passthrough', !!passthroughNav, 'passthrough click did not navigate');
+          assert('nav-passthrough-default-prevented', passthroughEvent.defaultPrevented === true, String(passthroughEvent.defaultPrevented));
+          pressSpace(false);
+          await wait(60);
+
+          // window.open(http(s)) is bridged; other schemes fall back to the original
+          var navCountBeforeOpen = countNavigate();
+          var openStart = messages.length;
+          var openedWindow = window.open('https://example.com/opened');
+          var openNav = await waitForNewMessage(
+            'navigate',
+            function (data) {
+              return data.url === 'https://example.com/opened' && data.source === 'window-open';
+            },
+            openStart,
+            2000
+          );
+          assert('nav-window-open', !!openNav, 'window.open was not bridged');
+          assert('nav-window-open-null', openedWindow === null, String(openedWindow));
+          window.open('mailto:test@example.com');
+          await wait(120);
+          assert('nav-window-open-fallback', countNavigate() === navCountBeforeOpen + 1, 'non-http window.open must fall back');
+          set('nav-count', countNavigate());
+
+          /* ---- done ---- */
+          assert('no-errors', errors.length === 0, errors.join(' | '));
+          set('done', '1');
+          pass();
+        }
+
+        async function runReadyUrl(root, kind) {
+          assert('overlay-root', !!root, 'missing runtime overlay');
+          var readyEntries = [];
+          for (var readyIndex = 0; readyIndex < messages.length; readyIndex += 1) {
+            if (messages[readyIndex].type === 'ready') readyEntries.push(messages[readyIndex]);
+          }
+          assert('ready-url-field', readyEntries.length > 0 && typeof readyEntries[0].payload.url === 'string', 'ready.url missing');
+          var readyUrl = readyEntries.length ? String(readyEntries[0].payload.url || '') : '';
+          set('ready-url-value', readyUrl);
+          if (kind === 'meta') {
+            assert('ready-url-meta', readyUrl === 'https://example.com/final-page', readyUrl);
+          } else {
+            assert('ready-url-query', readyUrl === 'https://example.com/from-query', readyUrl);
+          }
+          assert('no-errors', errors.length === 0, errors.join(' | '));
+          set('done', '1');
+          pass();
+        }
+
+        async function runTall(root) {
+          assert('overlay-root', !!root, 'missing runtime overlay');
+          var green = pageRect(document.getElementById('green-box'));
+          var pageWidth = Math.max(1, Math.ceil(document.documentElement.scrollWidth));
+          var pageHeight = Math.max(1, Math.ceil(document.documentElement.scrollHeight));
+          set('tall-page-size', pageWidth + 'x' + pageHeight);
+          window.postMessage(
+            {
+              channel: 'dsh-web-annotator',
+              type: 'set-annotations',
+              payload: { annotations: [{ id: 'tall-green', number: 1, kind: 'element', rect: green }] }
+            },
+            '*'
+          );
+          await wait(40);
+          var shot = await capture('req-tall-full', ['tall-green'], { mode: 'full' });
+          assert('tall-received', !!shot, 'no screenshots message');
+          var item = shot.items && shot.items[0];
+          assert(
+            'tall-single',
+            Array.isArray(shot.items) && shot.items.length === 1 && !!item && item.id === '__page__',
+            JSON.stringify(
+              (shot.items || []).map(function (entry) {
+                return entry.id;
+              })
+            )
+          );
+          var longEdge = item ? Math.max(item.width, item.height) : 0;
+          var bytes = item ? bytesOf(item.dataUrl) : 0;
+          set('tall-size', item ? item.width + 'x' + item.height : 'none');
+          set('tall-bytes', bytes);
+          assert('tall-page-is-tall', pageHeight > 2400, String(pageHeight));
+          assert('tall-long-edge', longEdge === 2400, String(longEdge));
+          assert('tall-within-limit', !!item && item.width <= 2400 && item.height <= 2400, item ? item.width + 'x' + item.height : 'none');
+          assert('tall-bytes-limit', bytes > 0 && bytes <= 3 * 1024 * 1024, String(bytes));
+
+          var canvas = item ? await decodeToCanvas(item.dataUrl) : null;
+          assert('tall-decoded', !!canvas, 'cannot decode the tall full image');
+          var scaleX = canvas ? canvas.width / pageWidth : 1;
+          var scaleY = canvas ? canvas.height / pageHeight : 1;
+          var border = pixelAt(canvas, green.x * scaleX, (green.y + green.height / 2) * scaleY);
+          assert('tall-border', isClose(border, [225, 29, 72], 60), String(border));
+          var badgeWhite = countPixels(
+            canvas,
+            green.x * scaleX,
+            green.y * scaleY,
+            22 * scaleX,
+            22 * scaleY,
+            function (r, g, b, a) {
+              return a > 200 && r > 200 && g > 200 && b > 200;
+            }
+          );
+          set('tall-badge-white', badgeWhite);
+          assert('tall-badge', badgeWhite >= 1, 'white badge pixels=' + badgeWhite);
+          assert('no-errors', errors.length === 0, errors.join(' | '));
+          set('done', '1');
+          pass();
+        }
+
+        async function runNoVendor(root) {
+          var green = pageRect(document.getElementById('green-box'));
+          window.postMessage(
+            {
+              channel: 'dsh-web-annotator',
+              type: 'set-annotations',
+              payload: { annotations: [{ id: 'green', number: 1, kind: 'element', rect: green }] }
+            },
+            '*'
+          );
+          await wait(40);
+          var shot = await capture('req-nv', ['green', 'green-2']);
+          assert('novendor-received', !!shot, 'no screenshots message');
+          assert('novendor-items-empty', Array.isArray(shot.items) && shot.items.length === 0, 'items=' + (shot.items || []).length);
+          var failed = shot.failed || [];
+          assert('novendor-all-failed', failed.length === 2, 'failed=' + failed.length);
+          assert(
+            'novendor-error-code',
+            failed.every(function (entry) {
+              return entry.error === 'html2canvas-load-failed';
+            }),
+            JSON.stringify(failed)
+          );
+          assert('novendor-overlay', !!root, 'overlay missing after load failure');
+          assert('novendor-no-errors', errors.length === 0, errors.join(' | '));
+          set('done', '1');
+          pass();
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div class="row" id="links-row">
+      <a id="rel-link" href="/next">相对链接</a>
+      <a id="ext-link" href="https://example.com/x">外部链接</a>
+      <a id="hash-link" href="#section">页内锚点</a>
+      <a id="js-link" href="javascript:void(0)">脚本链接</a>
+    </div>
+    <div class="row"><div id="green-box"></div></div>
+    <div class="row"><img id="cross-img" src="__CROSS_ORIGIN__/img.png" width="200" height="100" alt="cross-origin" /></div>
+    <div class="row"><div id="cross-css-box" class="cross-css"></div></div>
+    <div class="row"><p id="para">截图测试文本。</p></div>
+    <script src="/runtime.js"></script>
+  </body>
+</html>

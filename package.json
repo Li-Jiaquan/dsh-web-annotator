@@ -1,0 +1,33 @@
+{
+  "name": "@local/dsh-web-annotator",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "In-app web page annotation for DSH: annotate elements, areas and text in a proxied web page preview, then send structured comments to the agent.",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./runtime": "./runtime.js",
+    "./locale/*.json": "./locale/*.json",
+    "./vendor/*": "./vendor/*",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "runtime.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "vendor/*",
+    "icon.svg"
+  ],
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": []
+    }
+  }
+}

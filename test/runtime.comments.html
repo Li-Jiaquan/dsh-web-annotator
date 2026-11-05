@@ -1,0 +1,736 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>DSH Web Annotator — in-page comment popover test page</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+      }
+      body {
+        padding: 16px;
+        background: #ffffff;
+        color: #1f2937;
+        font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      }
+      #top-btn {
+        display: block;
+        width: 160px;
+        height: 36px;
+      }
+      .spacer {
+        height: 200px;
+      }
+      #para {
+        margin: 0;
+        width: 420px;
+        line-height: 1.6;
+      }
+    </style>
+    <script>
+      /*
+       * v1.2 harness (SPEC §11): drives the in-page comment popover and the
+       * floating action bar through real postMessage traffic and real DOM
+       * events, then records every observation into data-test-* attributes
+       * for `--dump-dom` assertions.
+       */
+      (function () {
+        'use strict';
+
+        var htmlEl = document.documentElement;
+        var seen = [];
+        var errors = [];
+        var messages = [];
+        var waiters = [];
+        var state = { started: false, done: false };
+        var watchdog = setTimeout(function () {
+          fail('timeout', 'harness did not finish');
+        }, 30000);
+
+        function set(name, value) {
+          try {
+            htmlEl.setAttribute('data-test-' + name, String(value));
+          } catch (error) {
+            /* ignore */
+          }
+        }
+
+        function pass() {
+          if (state.done) return;
+          state.done = true;
+          clearTimeout(watchdog);
+          set('status', 'pass');
+        }
+
+        function fail(step, detail) {
+          if (state.done) return;
+          state.done = true;
+          clearTimeout(watchdog);
+          set('status', 'fail');
+          set('failed-step', step + (detail ? ':' + detail : ''));
+        }
+
+        function assert(name, ok, detail) {
+          set(name, ok ? '1' : '0');
+          if (!ok) throw new Error(name + (detail ? ':' + detail : ''));
+        }
+
+        function wait(ms) {
+          return new Promise(function (resolve) {
+            setTimeout(resolve, ms);
+          });
+        }
+
+        function waitForMessage(type, predicate, timeoutMs) {
+          return new Promise(function (resolve) {
+            var waiter = { type: type, predicate: predicate, resolve: resolve, timer: 0 };
+            waiter.timer = setTimeout(function () {
+              var index = waiters.indexOf(waiter);
+              if (index >= 0) waiters.splice(index, 1);
+              resolve(null);
+            }, timeoutMs || 2000);
+            waiters.push(waiter);
+          });
+        }
+
+        function hostEl() {
+          return document.getElementById('dsh-web-annotator-root');
+        }
+
+        function shadowEl() {
+          var host = hostEl();
+          return host && host.shadowRoot ? host.shadowRoot : null;
+        }
+
+        function q(selector) {
+          var shadow = shadowEl();
+          return shadow ? shadow.querySelector(selector) : null;
+        }
+
+        function pageRect(element) {
+          var rect = element.getBoundingClientRect();
+          var sx = window.scrollX || window.pageXOffset || 0;
+          var sy = window.scrollY || window.pageYOffset || 0;
+          return {
+            x: Math.round(rect.left + sx),
+            y: Math.round(rect.top + sy),
+            width: Math.round(rect.width),
+            height: Math.round(rect.height)
+          };
+        }
+
+        function popoverEl() {
+          return q('.dsha-pop');
+        }
+
+        function popRect() {
+          var popover = popoverEl();
+          return popover ? popover.getBoundingClientRect() : null;
+        }
+
+        function markerFor(id) {
+          var shadow = shadowEl();
+          if (!shadow) return null;
+          var markers = shadow.querySelectorAll('.dsha-marker');
+          for (var i = 0; i < markers.length; i += 1) {
+            if (markers[i].getAttribute('data-dsha-id') === id) return markers[i];
+          }
+          return null;
+        }
+
+        function markerRect(id) {
+          var marker = markerFor(id);
+          return marker ? marker.getBoundingClientRect() : null;
+        }
+
+        function clickEl(element) {
+          if (!element) return false;
+          try {
+            element.dispatchEvent(new MouseEvent('click', { bubbles: true, composed: true, cancelable: true }));
+            return true;
+          } catch (error) {
+            return false;
+          }
+        }
+
+        function pointerOn(target, type, x, y) {
+          if (!target) return false;
+          try {
+            target.dispatchEvent(
+              new PointerEvent(type, {
+                bubbles: true,
+                composed: true,
+                cancelable: true,
+                clientX: x,
+                clientY: y,
+                pointerId: 7,
+                pointerType: 'mouse',
+                isPrimary: true,
+                button: type === 'pointermove' ? -1 : 0,
+                buttons: type === 'pointerup' ? 0 : 1
+              })
+            );
+            return true;
+          } catch (error) {
+            return false;
+          }
+        }
+
+        function openMarker(id) {
+          var marker = markerFor(id);
+          if (!marker) return false;
+          var rect = marker.getBoundingClientRect();
+          var x = rect.left + rect.width / 2;
+          var y = rect.top + rect.height / 2;
+          pointerOn(marker, 'pointerdown', x, y);
+          pointerOn(marker, 'pointerup', x, y);
+          return true;
+        }
+
+        function pressEscape() {
+          try {
+            document.dispatchEvent(
+              new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, composed: true, cancelable: true })
+            );
+          } catch (error) {
+            /* ignore */
+          }
+        }
+
+        function outsideClick() {
+          var hit = q('.dsha-hit');
+          if (!hit) return false;
+          return pointerOn(hit, 'pointerdown', 600, 300);
+        }
+
+        /* v1.3 SPEC §12.1: Space passthrough helpers. */
+        function pressSpace(down) {
+          try {
+            document.dispatchEvent(
+              new KeyboardEvent(down ? 'keydown' : 'keyup', {
+                code: 'Space',
+                key: ' ',
+                bubbles: true,
+                composed: true,
+                cancelable: true
+              })
+            );
+          } catch (error) {
+            /* ignore */
+          }
+        }
+
+        function dispatchSpaceOn(target) {
+          try {
+            target.dispatchEvent(
+              new KeyboardEvent('keydown', { code: 'Space', key: ' ', bubbles: true, composed: true, cancelable: true })
+            );
+          } catch (error) {
+            /* ignore */
+          }
+        }
+
+        function intersects(a, b) {
+          if (!a || !b) return false;
+          return !(a.right <= b.left || a.left >= b.right || a.bottom <= b.top || a.top >= b.bottom);
+        }
+
+        function deletes() {
+          return messages.filter(function (entry) {
+            return entry.type === 'annotation-delete';
+          });
+        }
+
+        window.addEventListener('message', function (event) {
+          var data = event.data;
+          if (!data || data.channel !== 'dsh-web-annotator') return;
+          seen.push(data.type);
+          set('seen', seen.join(','));
+          messages.push({ type: data.type, data: data });
+
+          for (var index = waiters.length - 1; index >= 0; index -= 1) {
+            var waiter = waiters[index];
+            if (waiter.type !== data.type) continue;
+            if (waiter.predicate && !waiter.predicate(data)) continue;
+            clearTimeout(waiter.timer);
+            waiters.splice(index, 1);
+            waiter.resolve(data);
+          }
+
+          if (data.type === 'ready') {
+            set('ready', '1');
+            var readyUrl = data.payload && typeof data.payload.url === 'string' ? data.payload.url : '';
+            set('ready-url', readyUrl ? '1' : '0');
+            set('ready-url-value', readyUrl);
+            if (!state.started) {
+              state.started = true;
+              run().catch(function (error) {
+                fail('run', (error && error.message) || String(error));
+              });
+            }
+            return;
+          }
+          if (data.type === 'error') {
+            errors.push(String((data.payload && data.payload.message) || ''));
+            set('runtime-errors', errors.join(' | '));
+          }
+        });
+
+        window.addEventListener('error', function (event) {
+          errors.push('window:' + String((event && event.message) || ''));
+          set('runtime-errors', errors.join(' | '));
+        });
+
+        async function run() {
+          var host = hostEl();
+          assert('overlay-root', !!host, 'missing overlay');
+          assert('shadow-root', !!host && !!host.shadowRoot, 'missing shadow root');
+
+          var popover = popoverEl();
+          var bar = q('.dsha-bar');
+          assert('popover-in-shadow', !!popover, 'popover not in shadow DOM');
+          assert('popover-not-escaped', document.querySelector('.dsha-pop') === null, 'popover escaped to page DOM');
+          assert('bar-in-shadow', !!bar, 'action bar not in shadow DOM');
+          assert('bar-hidden-initial', !!bar && bar.style.display === 'none', 'bar visible with 0 annotations');
+          assert(
+            'bar-count-initial',
+            !!q('.dsha-bar-count') && q('.dsha-bar-count').textContent.indexOf('批注 0 条') === 0,
+            q('.dsha-bar-count') ? q('.dsha-bar-count').textContent : 'missing'
+          );
+
+          // annotation mode on
+          var modePending = waitForMessage('mode', function (data) {
+            return data.payload && data.payload.active === true;
+          });
+          window.postMessage({ channel: 'dsh-web-annotator', type: 'set-mode', payload: { active: true } }, '*');
+          var modeAck = await modePending;
+          assert('mode-ack', !!modeAck, 'no mode ack');
+
+          var topRect = pageRect(document.getElementById('top-btn'));
+          var paraRect = pageRect(document.getElementById('para'));
+
+          // v1.3: count page-level clicks so passthrough can be proven.
+          var topButton = document.getElementById('top-btn');
+          window.__dshTopClicks = 0;
+          topButton.addEventListener('click', function () {
+            window.__dshTopClicks += 1;
+          });
+
+          window.postMessage(
+            {
+              channel: 'dsh-web-annotator',
+              type: 'set-annotations',
+              payload: {
+                annotations: [
+                  { id: 'a1', number: 1, kind: 'element', rect: topRect },
+                  { id: 'a2', number: 2, kind: 'text', rect: paraRect, selectedText: '示例选中文本' }
+                ]
+              }
+            },
+            '*'
+          );
+          await wait(40);
+          assert('marker-count-2', host.getAttribute('data-dsh-markers') === '2', host.getAttribute('data-dsh-markers'));
+          assert('bar-visible', !!bar && bar.style.display === 'flex', bar ? bar.style.display : 'missing');
+          assert(
+            'bar-count-2',
+            !!q('.dsha-bar-count') && q('.dsha-bar-count').textContent === '批注 2 条 · ',
+            q('.dsha-bar-count') ? q('.dsha-bar-count').textContent : 'missing'
+          );
+
+          /* ---- v1.3 space passthrough (SPEC §12.1) ---- */
+          assert('passthrough-initial-off', host.getAttribute('data-dsh-passthrough') !== '1', host.getAttribute('data-dsh-passthrough'));
+          var hitEl = q('.dsha-hit');
+          var markerA1 = markerFor('a1');
+          assert('passthrough-hit-exists', !!hitEl, 'no hit layer');
+          var a1Box = markerA1 ? markerA1.getBoundingClientRect() : null;
+          var a1Center = a1Box ? { x: a1Box.left + a1Box.width / 2, y: a1Box.top + a1Box.height / 2 } : null;
+          var underBefore = a1Center ? document.elementFromPoint(a1Center.x, a1Center.y) : null;
+          assert(
+            'passthrough-hit-test-before',
+            !!underBefore && (underBefore === host || underBefore === markerA1),
+            underBefore ? underBefore.id || underBefore.tagName : 'none'
+          );
+
+          var clicksBefore = window.__dshTopClicks || 0;
+          pressSpace(true);
+          await wait(50);
+          assert('passthrough-on', host.getAttribute('data-dsh-passthrough') === '1', host.getAttribute('data-dsh-passthrough'));
+          var hint = q('.dsha-hint');
+          assert('passthrough-hint', !!hint && hint.style.display === 'block', hint ? hint.style.display : 'missing');
+          assert(
+            'passthrough-hint-text',
+            !!hint && hint.textContent === '松开空格键恢复批注模式',
+            hint ? hint.textContent : 'missing'
+          );
+          assert(
+            'passthrough-hint-pointer',
+            !!hint && getComputedStyle(hint).pointerEvents === 'none',
+            hint ? getComputedStyle(hint).pointerEvents : 'missing'
+          );
+          assert(
+            'passthrough-hit-none',
+            !!hitEl && getComputedStyle(hitEl).pointerEvents === 'none',
+            hitEl ? getComputedStyle(hitEl).pointerEvents : 'missing'
+          );
+          assert(
+            'passthrough-marker-none',
+            !!markerA1 && getComputedStyle(markerA1).pointerEvents === 'none',
+            markerA1 ? getComputedStyle(markerA1).pointerEvents : 'missing'
+          );
+
+          // Real hit testing must now reach the page button, not our overlay.
+          var btnRect = pageRect(topButton);
+          var underDuring = document.elementFromPoint(btnRect.x + btnRect.width / 2, btnRect.y + btnRect.height / 2);
+          assert(
+            'passthrough-page-under-pointer',
+            underDuring === topButton,
+            underDuring ? underDuring.id || underDuring.tagName : 'none'
+          );
+          // The page's own click handler runs while Space is held.
+          topButton.dispatchEvent(new MouseEvent('click', { bubbles: true, composed: true, cancelable: true }));
+          assert('passthrough-page-click', (window.__dshTopClicks || 0) === clicksBefore + 1, String(window.__dshTopClicks));
+
+          // No selection gesture may create an annotation while passthrough is on.
+          var selectCountBefore = seen.filter(function (type) {
+            return type === 'select';
+          }).length;
+          pointerOn(hitEl, 'pointerdown', 300, 200);
+          pointerOn(hitEl, 'pointerup', 300, 200);
+          await wait(50);
+          assert(
+            'passthrough-no-new-annotation',
+            seen.filter(function (type) {
+              return type === 'select';
+            }).length === selectCountBefore,
+            'a select message was posted during passthrough'
+          );
+
+          pressSpace(false);
+          await wait(50);
+          assert('passthrough-off', host.getAttribute('data-dsh-passthrough') !== '1', host.getAttribute('data-dsh-passthrough'));
+          assert('passthrough-hint-hidden', !!hint && hint.style.display === 'none', hint ? hint.style.display : 'missing');
+          assert(
+            'passthrough-hit-restored',
+            !!hitEl && getComputedStyle(hitEl).pointerEvents === 'auto',
+            hitEl ? getComputedStyle(hitEl).pointerEvents : 'missing'
+          );
+          assert(
+            'passthrough-marker-restored',
+            !!markerA1 && getComputedStyle(markerA1).pointerEvents === 'auto',
+            markerA1 ? getComputedStyle(markerA1).pointerEvents : 'missing'
+          );
+          var underAfter = a1Center ? document.elementFromPoint(a1Center.x, a1Center.y) : null;
+          assert(
+            'passthrough-hit-test-after',
+            !!underAfter && (underAfter === host || underAfter === markerA1),
+            underAfter ? underAfter.id || underAfter.tagName : 'none'
+          );
+
+          // Typing Space inside the popover textarea / a page input is a normal char.
+          openMarker('a1');
+          await wait(40);
+          var spaceTa = q('.dsha-pop-input');
+          assert(
+            'passthrough-popover-open',
+            !!spaceTa && !!popoverEl() && popoverEl().style.display === 'block',
+            'popover not open'
+          );
+          dispatchSpaceOn(spaceTa);
+          await wait(30);
+          assert(
+            'passthrough-textarea-space',
+            host.getAttribute('data-dsh-passthrough') !== '1',
+            host.getAttribute('data-dsh-passthrough')
+          );
+          clickEl(q('.dsha-pop-close'));
+          await wait(30);
+          dispatchSpaceOn(document.getElementById('page-input'));
+          await wait(30);
+          assert(
+            'passthrough-input-space',
+            host.getAttribute('data-dsh-passthrough') !== '1',
+            host.getAttribute('data-dsh-passthrough')
+          );
+
+          // marker click opens the popover near the marker
+          assert('marker-a1-exists', !!markerFor('a1'), 'no marker a1');
+          openMarker('a1');
+          await wait(40);
+          assert('popover-opened', !!popoverEl() && popoverEl().style.display === 'block', 'popover not opened');
+          assert(
+            'popover-title-a1',
+            !!q('.dsha-pop-title') && q('.dsha-pop-title').textContent === '元素批注 1',
+            q('.dsha-pop-title') ? q('.dsha-pop-title').textContent : 'missing'
+          );
+          var rect1 = popRect();
+          var marker1 = markerRect('a1');
+          assert('popover-width', !!rect1 && rect1.width > 0 && rect1.width <= 320, rect1 ? rect1.width : 'none');
+          assert(
+            'popover-in-viewport',
+            !!rect1 &&
+              rect1.left >= 0 &&
+              rect1.top >= 0 &&
+              rect1.right <= window.innerWidth + 0.5 &&
+              rect1.bottom <= window.innerHeight + 0.5,
+            rect1 ? [rect1.left, rect1.top, rect1.right, rect1.bottom].join(',') : 'none'
+          );
+          assert(
+            'popover-below-marker',
+            !!rect1 && !!marker1 && rect1.top > marker1.bottom - 1,
+            rect1 && marker1 ? rect1.top + '/' + marker1.bottom : 'none'
+          );
+          assert('popover-not-cover-marker', !!rect1 && !!marker1 && !intersects(rect1, marker1), 'popover overlaps marker');
+          set('popover-a1-rect', rect1 ? [rect1.left, rect1.top, rect1.width, rect1.height].map(Math.round).join(',') : 'none');
+          set('popover-a1-marker', marker1 ? [marker1.left, marker1.top, marker1.right, marker1.bottom].map(Math.round).join(',') : 'none');
+
+          // type a comment + save -> annotation-comment, marker becomes "commented"
+          var input = q('.dsha-pop-input');
+          assert('popover-input', !!input, 'no textarea');
+          input.value = '请把按钮改成绿色';
+          var commentPending = waitForMessage('annotation-comment', function (data) {
+            return data.id === 'a1';
+          });
+          clickEl(q('.dsha-pop-save'));
+          var commentMessage = await commentPending;
+          assert(
+            'comment-sent',
+            !!commentMessage && commentMessage.comment === '请把按钮改成绿色',
+            commentMessage ? JSON.stringify(commentMessage) : 'none'
+          );
+          assert(
+            'marker-commented',
+            !!markerFor('a1') && markerFor('a1').classList.contains('is-commented'),
+            'marker not in commented state'
+          );
+          assert('popover-closed-after-save', !!popoverEl() && popoverEl().style.display === 'none', 'popover still open');
+
+          // reopen -> textarea prefilled with the saved comment
+          openMarker('a1');
+          await wait(40);
+          assert('popover-reopened', !!popoverEl() && popoverEl().style.display === 'block', 'popover did not reopen');
+          assert(
+            'popover-prefilled',
+            !!q('.dsha-pop-input') && q('.dsha-pop-input').value === '请把按钮改成绿色',
+            q('.dsha-pop-input') ? q('.dsha-pop-input').value : 'missing'
+          );
+
+          // Esc closes the popover and must NOT report `escape`
+          var escapeBefore = seen.filter(function (type) {
+            return type === 'escape';
+          }).length;
+          pressEscape();
+          await wait(50);
+          assert('escape-closes-popover', !!popoverEl() && popoverEl().style.display === 'none', 'popover still open after Escape');
+          assert(
+            'no-escape-message',
+            seen.filter(function (type) {
+              return type === 'escape';
+            }).length === escapeBefore,
+            'escape message sent while closing popover'
+          );
+
+          // popover for the lower annotation flips above the marker
+          openMarker('a2');
+          await wait(40);
+          assert(
+            'popover-title-a2',
+            !!q('.dsha-pop-title') && q('.dsha-pop-title').textContent === '文本批注 2',
+            q('.dsha-pop-title') ? q('.dsha-pop-title').textContent : 'missing'
+          );
+          var rect2 = popRect();
+          var marker2 = markerRect('a2');
+          assert(
+            'popover-above-marker',
+            !!rect2 && !!marker2 && rect2.bottom <= marker2.top + 1,
+            rect2 && marker2 ? rect2.bottom + '/' + marker2.top : 'none'
+          );
+          assert('popover-not-cover-marker-2', !!rect2 && !!marker2 && !intersects(rect2, marker2), 'popover overlaps marker');
+          set('popover-a2-rect', rect2 ? [rect2.left, rect2.top, rect2.width, rect2.height].map(Math.round).join(',') : 'none');
+
+          // click outside closes the popover
+          outsideClick();
+          await wait(40);
+          assert('outside-click-closes', !!popoverEl() && popoverEl().style.display === 'none', 'popover still open');
+
+          // focus-annotation opens the popover
+          window.postMessage({ channel: 'dsh-web-annotator', type: 'focus-annotation', payload: { id: 'a2' } }, '*');
+          await wait(80);
+          assert('focus-opens-popover', !!popoverEl() && popoverEl().style.display === 'block', 'focus did not open popover');
+          assert(
+            'focus-popover-title',
+            !!q('.dsha-pop-title') && q('.dsha-pop-title').textContent === '文本批注 2',
+            q('.dsha-pop-title') ? q('.dsha-pop-title').textContent : 'missing'
+          );
+          clickEl(q('.dsha-pop-close'));
+          await wait(30);
+          assert('close-button-closes', !!popoverEl() && popoverEl().style.display === 'none', 'close button did not close');
+
+          // delete from the popover -> annotation-delete
+          openMarker('a1');
+          await wait(40);
+          var deletePending = waitForMessage('annotation-delete', function (data) {
+            return data.id === 'a1';
+          });
+          clickEl(q('.dsha-pop-delete'));
+          var deleteMessage = await deletePending;
+          await wait(40);
+          assert('delete-sent', !!deleteMessage && deleteMessage.id === 'a1', deleteMessage ? JSON.stringify(deleteMessage) : 'none');
+          assert('marker-count-1', host.getAttribute('data-dsh-markers') === '1', host.getAttribute('data-dsh-markers'));
+          assert(
+            'bar-count-1',
+            !!q('.dsha-bar-count') && q('.dsha-bar-count').textContent === '批注 1 条 · ',
+            q('.dsha-bar-count') ? q('.dsha-bar-count').textContent : 'missing'
+          );
+          assert('popover-closed-after-delete', !!popoverEl() && popoverEl().style.display === 'none', 'popover open after delete');
+
+          // set-annotations restores the commented state + popover prefill
+          window.postMessage(
+            {
+              channel: 'dsh-web-annotator',
+              type: 'set-annotations',
+              payload: {
+                annotations: [
+                  {
+                    id: 'a2',
+                    number: 1,
+                    kind: 'text',
+                    rect: paraRect,
+                    selectedText: '示例选中文本',
+                    comment: '文本太长'
+                  }
+                ]
+              }
+            },
+            '*'
+          );
+          await wait(50);
+          assert(
+            'comment-restored-marker',
+            !!markerFor('a2') && markerFor('a2').classList.contains('is-commented'),
+            'restored comment did not mark the marker'
+          );
+          window.postMessage({ channel: 'dsh-web-annotator', type: 'focus-annotation', payload: { id: 'a2' } }, '*');
+          await wait(80);
+          assert(
+            'restored-prefill',
+            !!q('.dsha-pop-input') && q('.dsha-pop-input').value === '文本太长',
+            q('.dsha-pop-input') ? q('.dsha-pop-input').value : 'missing'
+          );
+
+          // saving an empty comment clears the commented state
+          q('.dsha-pop-input').value = '';
+          var emptyPending = waitForMessage('annotation-comment', function (data) {
+            return data.id === 'a2' && data.comment === '';
+          });
+          clickEl(q('.dsha-pop-save'));
+          var emptyMessage = await emptyPending;
+          await wait(30);
+          assert('empty-comment-saved', !!emptyMessage && emptyMessage.comment === '', emptyMessage ? JSON.stringify(emptyMessage) : 'none');
+          assert(
+            'marker-uncommented',
+            !!markerFor('a2') && !markerFor('a2').classList.contains('is-commented'),
+            'marker still in commented state'
+          );
+
+          // floating action bar -> request-submit (label is v1.4「写入对话框」)
+          var barSendBtn = q('.dsha-bar-send');
+          assert(
+            'bar-send-label',
+            !!barSendBtn && barSendBtn.textContent === '写入对话框',
+            barSendBtn ? barSendBtn.textContent : 'missing'
+          );
+          assert(
+            'bar-send-aria',
+            !!barSendBtn &&
+              barSendBtn.getAttribute('title') === '写入对话框' &&
+              barSendBtn.getAttribute('aria-label') === '写入对话框',
+            barSendBtn ? barSendBtn.getAttribute('title') + '/' + barSendBtn.getAttribute('aria-label') : 'missing'
+          );
+          var submitPending = waitForMessage('request-submit', null);
+          clickEl(barSendBtn);
+          var submitMessage = await submitPending;
+          assert('bar-send', !!submitMessage, 'no request-submit message');
+
+          // floating bar clear -> one annotation-delete per annotation, then local clear
+          var deletesBefore = deletes().length;
+          var markersBefore = Number(host.getAttribute('data-dsh-markers'));
+          clickEl(q('.dsha-bar-clear'));
+          await wait(80);
+          var deletesAfter = deletes().length;
+          assert(
+            'bar-clear-delete-count',
+            deletesAfter - deletesBefore === markersBefore && markersBefore === 1,
+            deletesAfter - deletesBefore + '/' + markersBefore
+          );
+          var allDeletes = deletes();
+          var lastDelete = allDeletes[allDeletes.length - 1];
+          assert('bar-clear-delete-id', !!lastDelete && lastDelete.data.id === 'a2', lastDelete ? JSON.stringify(lastDelete.data) : 'none');
+          assert('bar-hidden-after-clear', !!bar && bar.style.display === 'none', 'bar visible after clear');
+          assert('markers-after-clear', host.getAttribute('data-dsh-markers') === '0', host.getAttribute('data-dsh-markers'));
+
+          // parent `clear` clears locally and must not emit extra annotation-delete
+          window.postMessage(
+            {
+              channel: 'dsh-web-annotator',
+              type: 'set-annotations',
+              payload: { annotations: [{ id: 'a9', number: 1, kind: 'element', rect: topRect }] }
+            },
+            '*'
+          );
+          await wait(40);
+          var deletesBeforeClear = deletes().length;
+          window.postMessage({ channel: 'dsh-web-annotator', type: 'clear' }, '*');
+          await wait(50);
+          assert('parent-clear-markers', host.getAttribute('data-dsh-markers') === '0', host.getAttribute('data-dsh-markers'));
+          assert('parent-clear-bar-hidden', !!bar && bar.style.display === 'none', 'bar visible after parent clear');
+          assert('parent-clear-no-deletes', deletes().length === deletesBeforeClear, deletes().length + '/' + deletesBeforeClear);
+
+          /* ---- v1.3: parent set-mode active=false clears passthrough ---- */
+          window.postMessage({ channel: 'dsh-web-annotator', type: 'set-mode', payload: { active: true } }, '*');
+          await wait(50);
+          assert('passthrough-reenable-mode', host.getAttribute('data-dsh-mode') === '1', host.getAttribute('data-dsh-mode'));
+          pressSpace(true);
+          await wait(40);
+          assert(
+            'passthrough-on-before-mode-off',
+            host.getAttribute('data-dsh-passthrough') === '1',
+            host.getAttribute('data-dsh-passthrough')
+          );
+          window.postMessage({ channel: 'dsh-web-annotator', type: 'set-mode', payload: { active: false } }, '*');
+          await wait(60);
+          assert(
+            'passthrough-cleared-by-mode-off',
+            host.getAttribute('data-dsh-passthrough') !== '1',
+            host.getAttribute('data-dsh-passthrough')
+          );
+          assert('passthrough-mode-off', host.getAttribute('data-dsh-mode') === '0', host.getAttribute('data-dsh-mode'));
+          pressSpace(false);
+          // Space with annotation mode off must not enter passthrough.
+          pressSpace(true);
+          await wait(40);
+          assert(
+            'passthrough-mode-off-no-enter',
+            host.getAttribute('data-dsh-passthrough') !== '1',
+            host.getAttribute('data-dsh-passthrough')
+          );
+          pressSpace(false);
+
+          assert('no-errors', errors.length === 0, errors.join(' | '));
+          set('delete-count', deletes().length);
+          set('done', '1');
+          pass();
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <button id="top-btn" type="button">顶部按钮</button>
+    <div class="spacer"></div>
+    <p id="para">这是一段用于验证文本批注悬浮窗定位、评论保存与回填的示例文字。</p>
+    <input id="page-input" type="text" aria-label="页面输入框" />
+    <script src="../runtime.js"></script>
+  </body>
+</html>

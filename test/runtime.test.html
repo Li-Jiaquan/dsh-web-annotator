@@ -1,0 +1,578 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>DSH Web Annotator — runtime test page</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+      }
+      body {
+        padding: 20px;
+        background: #f6f7f9;
+        color: #1f2937;
+        font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      }
+      h1 {
+        margin: 0 0 6px;
+        font-size: 18px;
+      }
+      h2 {
+        margin: 0 0 6px;
+        font-size: 15px;
+      }
+      #intro {
+        margin: 0 0 14px;
+        color: #4b5563;
+      }
+      .card {
+        margin: 0 0 12px;
+        padding: 14px;
+        background: #ffffff;
+        border: 1px solid #d7dbe2;
+        border-radius: 10px;
+        max-width: 520px;
+      }
+      .card p {
+        margin: 0 0 10px;
+      }
+      .row {
+        display: flex;
+        gap: 8px;
+      }
+      button {
+        font: inherit;
+        padding: 6px 14px;
+        border: 1px solid #c8ccd4;
+        border-radius: 8px;
+        background: #eef1f6;
+        cursor: pointer;
+      }
+      #para-1 {
+        margin: 0;
+        line-height: 1.6;
+      }
+      footer {
+        color: #6b7280;
+      }
+    </style>
+    <script>
+      /*
+       * Test harness for runtime.js (no external deps).
+       *
+       * It drives the runtime exactly like client.js would (hello / set-mode /
+       * set-annotations / focus-annotation / clear), simulates the three
+       * selection gestures with synthetic PointerEvents on the interaction
+       * layer, and writes the observed protocol messages into data-test-*
+       * attributes on <html> so that headless Chrome --dump-dom can assert
+       * them. It never fakes internals: only real DOM events and real
+       * postMessage traffic are used.
+       */
+      (function () {
+        'use strict';
+
+        var htmlEl = document.documentElement;
+        var seen = [];
+        var errors = [];
+        var state = {
+          hello: false,
+          modeRequested: false,
+          annotationsRequested: false,
+          markerClicks: 0,
+          done: false
+        };
+
+        var watchdog = setTimeout(function () {
+          fail('timeout', 'harness did not finish');
+        }, 3500);
+
+        function set(name, value) {
+          try {
+            htmlEl.setAttribute('data-test-' + name, String(value));
+          } catch (error) {
+            /* ignore */
+          }
+        }
+
+        function pass() {
+          if (state.done) return;
+          state.done = true;
+          clearTimeout(watchdog);
+          set('status', 'pass');
+          set('seen-final', seen.join(','));
+        }
+
+        function fail(step, detail) {
+          if (state.done) return;
+          state.done = true;
+          clearTimeout(watchdog);
+          set('status', 'fail');
+          set('failed-step', step + (detail ? ':' + detail : ''));
+          set('seen-final', seen.join(','));
+        }
+
+        function assert(name, ok, detail) {
+          set(name, ok ? '1' : '0');
+          if (!ok) throw new Error(name + (detail ? ':' + detail : ''));
+        }
+
+        function hostEl() {
+          return document.getElementById('dsh-web-annotator-root');
+        }
+
+        function shadowRootEl() {
+          var host = hostEl();
+          return host && host.shadowRoot ? host.shadowRoot : null;
+        }
+
+        function hitLayer() {
+          var shadow = shadowRootEl();
+          return shadow ? shadow.querySelector('.dsha-hit') : null;
+        }
+
+        function wait(ms) {
+          return new Promise(function (resolve) {
+            setTimeout(resolve, ms);
+          });
+        }
+
+        function makePointerEvent(type, x, y, options) {
+          var init = {
+            bubbles: true,
+            composed: true,
+            cancelable: true,
+            clientX: x,
+            clientY: y,
+            screenX: x,
+            screenY: y,
+            pointerId: 7,
+            pointerType: 'mouse',
+            isPrimary: true,
+            button: type === 'pointermove' ? -1 : 0,
+            buttons: type === 'pointerup' ? 0 : 1,
+            shiftKey: false
+          };
+          if (options) {
+            for (var key in options) {
+              if (Object.prototype.hasOwnProperty.call(options, key)) init[key] = options[key];
+            }
+          }
+          try {
+            return new PointerEvent(type, init);
+          } catch (error) {
+            return null;
+          }
+        }
+
+        function dispatchOn(target, type, x, y, options) {
+          var event = makePointerEvent(type, x, y, options);
+          if (!event || !target) return false;
+          try {
+            target.dispatchEvent(event);
+            return true;
+          } catch (error) {
+            return false;
+          }
+        }
+
+        function dispatchHit(type, x, y, options) {
+          var hit = hitLayer();
+          if (!hit) return false;
+          return dispatchOn(hit, type, x, y, options);
+        }
+
+        function waitForMessage(type, timeoutMs, predicate) {
+          return new Promise(function (resolve) {
+            var finished = false;
+            var timer = setTimeout(function () {
+              done(null);
+            }, timeoutMs || 1200);
+
+            function done(value) {
+              if (finished) return;
+              finished = true;
+              clearTimeout(timer);
+              window.removeEventListener('message', onMessage);
+              resolve(value);
+            }
+
+            function onMessage(event) {
+              var data = event.data;
+              if (!data || data.channel !== 'dsh-web-annotator' || data.type !== type) return;
+              if (predicate && !predicate(data.payload)) return;
+              done(data.payload);
+            }
+
+            window.addEventListener('message', onMessage);
+          });
+        }
+
+        function gesture(from, to, options) {
+          var pending = waitForMessage('select', 1500);
+          dispatchHit('pointerdown', from.x, from.y, options);
+          var steps = 4;
+          for (var index = 1; index <= steps; index += 1) {
+            var x = from.x + ((to.x - from.x) * index) / steps;
+            var y = from.y + ((to.y - from.y) * index) / steps;
+            dispatchHit('pointermove', x, y, options);
+          }
+          dispatchHit('pointerup', to.x, to.y, options);
+          return pending;
+        }
+
+        /* ---------------------------------------------------------- *
+         * protocol observer (also acts as the "parent window" driver)
+         * ---------------------------------------------------------- */
+        window.addEventListener('message', function (event) {
+          var data = event.data;
+          if (!data || data.channel !== 'dsh-web-annotator') return;
+          seen.push(data.type);
+          set('seen', seen.join(','));
+
+          if (data.type === 'ready') {
+            set('ready', '1');
+            if (!state.hello) {
+              state.hello = true;
+              window.postMessage({ channel: 'dsh-web-annotator', type: 'hello' }, '*');
+            }
+            if (!state.modeRequested) {
+              state.modeRequested = true;
+              window.postMessage(
+                { channel: 'dsh-web-annotator', type: 'set-mode', payload: { active: true } },
+                '*'
+              );
+            }
+            return;
+          }
+
+          if (data.type === 'mode') {
+            var active = !!(data.payload && data.payload.active);
+            set('mode-active', active ? '1' : '0');
+            if (active) set('mode-ack-active', '1');
+            else set('mode-ack-inactive', '1');
+            if (active && !state.annotationsRequested) {
+              state.annotationsRequested = true;
+              window.postMessage(
+                {
+                  channel: 'dsh-web-annotator',
+                  type: 'set-annotations',
+                  payload: {
+                    annotations: [
+                      { id: 'a1', number: 1, kind: 'element', rect: { x: 40, y: 80, width: 200, height: 40 } },
+                      {
+                        id: 'a2',
+                        number: 2,
+                        kind: 'text',
+                        rect: { x: 40, y: 200, width: 260, height: 120 },
+                        selectedText: '示例选中文本'
+                      }
+                    ]
+                  }
+                },
+                '*'
+              );
+              setTimeout(function () {
+                runTests().catch(function (error) {
+                  fail('interaction', (error && error.message) || String(error));
+                });
+              }, 20);
+            }
+            return;
+          }
+
+          if (data.type === 'marker-click') {
+            state.markerClicks += 1;
+            set('marker-clicks', state.markerClicks);
+            return;
+          }
+
+          if (data.type === 'error') {
+            errors.push(String((data.payload && data.payload.message) || ''));
+            set('runtime-errors', errors.join(' | '));
+          }
+        });
+
+        /* ---------------------------------------------------------- *
+         * end-to-end checks
+         * ---------------------------------------------------------- */
+        async function runTests() {
+          var host = hostEl();
+          assert('overlay-root', !!host, 'missing #dsh-web-annotator-root');
+          assert('shadow-root', !!host.shadowRoot, 'missing open shadow root');
+          assert('host-attr', host.getAttribute('data-dsh-web-annotator') === '1', 'missing data attribute');
+          assert('ready-seen', seen.indexOf('ready') >= 0, 'no ready message');
+          assert('mode-seen', seen.indexOf('mode') >= 0, 'no mode ack');
+
+          // 1. set-annotations -> numbered markers
+          await wait(20);
+          assert(
+            'markers-after-set',
+            host.getAttribute('data-dsh-markers') === '2',
+            'count=' + host.getAttribute('data-dsh-markers')
+          );
+          set('markers-after-set-value', host.getAttribute('data-dsh-markers') || '');
+
+          // 2. plain click -> element anchor
+          var button = document.getElementById('save-btn');
+          var buttonRect = button.getBoundingClientRect();
+          var clickX = buttonRect.left + buttonRect.width / 2;
+          var clickY = buttonRect.top + buttonRect.height / 2;
+          var elementAnchor = await gesture({ x: clickX, y: clickY }, { x: clickX, y: clickY }, null);
+          assert(
+            'element-select',
+            !!elementAnchor && elementAnchor.kind === 'element',
+            elementAnchor ? elementAnchor.kind : 'no-select'
+          );
+          set('element-kind', elementAnchor && elementAnchor.kind);
+          set('element-tag', elementAnchor && elementAnchor.tagName);
+          set('element-selector', elementAnchor && elementAnchor.selector);
+          set('element-path', elementAnchor && elementAnchor.elementPath);
+          set('element-name', elementAnchor && elementAnchor.name);
+          assert('element-tag-button', elementAnchor.tagName === 'button', elementAnchor.tagName || '');
+          assert('element-has-rect', !!elementAnchor.rect && elementAnchor.rect.width > 0, 'no rect');
+          assert('element-has-viewport', !!elementAnchor.viewportRect, 'no viewportRect');
+          assert('element-has-point', !!elementAnchor.point, 'no point');
+          assert('element-is-fixed', typeof elementAnchor.isFixed === 'boolean', 'no isFixed');
+          assert('element-scroll', typeof elementAnchor.scrollX === 'number', 'no scrollX');
+          assert('element-frame', elementAnchor.frameUrl === null && Array.isArray(elementAnchor.framePath), 'frame fields');
+          assert('element-page-url', typeof elementAnchor.pageUrl === 'string' && elementAnchor.pageUrl !== '', 'no pageUrl');
+
+          // 3. shift+drag -> region anchor
+          var card = document.getElementById('card-1');
+          var cardRect = card.getBoundingClientRect();
+          var regionFrom = { x: cardRect.left + 12, y: cardRect.top + 12 };
+          var regionTo = {
+            x: cardRect.left + Math.min(220, cardRect.width - 12),
+            y: cardRect.top + Math.min(100, cardRect.height - 12)
+          };
+          var regionAnchor = await gesture(regionFrom, regionTo, { shiftKey: true });
+          assert(
+            'region-select',
+            !!regionAnchor && regionAnchor.kind === 'region',
+            regionAnchor ? regionAnchor.kind : 'no-select'
+          );
+          set('region-kind', regionAnchor && regionAnchor.kind);
+          set('region-width', regionAnchor && regionAnchor.rect ? regionAnchor.rect.width : 0);
+          set('region-height', regionAnchor && regionAnchor.rect ? regionAnchor.rect.height : 0);
+          assert(
+            'region-size',
+            !!regionAnchor.rect && regionAnchor.rect.width >= 8 && regionAnchor.rect.height >= 8,
+            regionAnchor.rect ? regionAnchor.rect.width + 'x' + regionAnchor.rect.height : 'no-rect'
+          );
+          assert('region-selected-text-null', regionAnchor.selectedText === null, 'region must not carry selectedText');
+
+          // 4. drag over paragraph text -> text anchor
+          var paragraph = document.getElementById('para-1');
+          var paragraphRect = paragraph.getBoundingClientRect();
+          var textY = paragraphRect.top + 12;
+          var textFrom = { x: paragraphRect.left + 6, y: textY };
+          var textTo = { x: paragraphRect.left + Math.min(paragraphRect.width - 10, 300), y: textY };
+          var textAnchor = await gesture(textFrom, textTo, null);
+          assert(
+            'text-select',
+            !!textAnchor && textAnchor.kind === 'text',
+            textAnchor ? textAnchor.kind : 'no-select'
+          );
+          set('text-kind', textAnchor && textAnchor.kind);
+          set('text-length', textAnchor && textAnchor.selectedText ? textAnchor.selectedText.length : 0);
+          assert(
+            'text-content',
+            !!textAnchor.selectedText && textAnchor.selectedText.length > 0,
+            String((textAnchor && textAnchor.selectedText) || '').slice(0, 40)
+          );
+          assert(
+            'text-selection-rects',
+            Array.isArray(textAnchor.selectionRects) && textAnchor.selectionRects.length > 0,
+            'no selectionRects'
+          );
+          assert(
+            'text-locator',
+            !!textAnchor.textLocator && typeof textAnchor.textLocator.startOffset === 'number',
+            'no textLocator'
+          );
+          assert('text-tag', !!textAnchor.tagName, 'no tagName');
+
+          // 5. marker hover + click (marker is our own overlay UI)
+          var shadow = shadowRootEl();
+          var markers = shadow.querySelectorAll('.dsha-marker');
+          assert('marker-count', markers.length === 2, String(markers.length));
+          var firstMarker = markers[0];
+
+          var hoverPending = waitForMessage('marker-hover', 1500, function (payload) {
+            return payload && payload.id === 'a1';
+          });
+          dispatchOn(firstMarker, 'pointermove', 40, 80, null);
+          var hoverPayload = await hoverPending;
+          assert('marker-hover', !!hoverPayload && hoverPayload.id === 'a1', hoverPayload ? String(hoverPayload.id) : 'no-hover');
+
+          var clickPending = waitForMessage('marker-click', 1500, function (payload) {
+            return payload && payload.id === 'a1';
+          });
+          dispatchOn(firstMarker, 'pointerdown', 40, 80, null);
+          dispatchOn(firstMarker, 'pointerup', 40, 80, null);
+          var clickPayload = await clickPending;
+          assert('marker-click', !!clickPayload && clickPayload.id === 'a1', clickPayload ? String(clickPayload.id) : 'no-click');
+          assert('marker-click-count', state.markerClicks === 1, String(state.markerClicks));
+
+          // 6. focus-annotation -> flash box shown (scrollIntoView + blink)
+          window.postMessage({ channel: 'dsh-web-annotator', type: 'focus-annotation', payload: { id: 'a2' } }, '*');
+          await wait(40);
+          var flashEl = shadowRootEl().querySelector('.dsha-box.is-flash');
+          assert('focus-annotation-flash', !!flashEl && flashEl.style.display === 'block', 'flash box not shown');
+
+          // 7. v1.2: focus-annotation opened the comment popover, so the first
+          // Escape closes the popover; the second Escape reports `escape`.
+          var popoverAfterFocus = shadowRootEl().querySelector('.dsha-pop');
+          assert(
+            'focus-annotation-popover',
+            !!popoverAfterFocus && popoverAfterFocus.style.display === 'block',
+            'popover not opened by focus-annotation'
+          );
+          try {
+            document.dispatchEvent(
+              new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, composed: true, cancelable: true })
+            );
+          } catch (error) {
+            /* ignore */
+          }
+          await wait(30);
+          assert(
+            'popover-closed-by-escape',
+            !!popoverAfterFocus && popoverAfterFocus.style.display === 'none',
+            'popover still open after Escape'
+          );
+          var escapePending = waitForMessage('escape', 1500).then(function () {
+            return true;
+          });
+          try {
+            document.dispatchEvent(
+              new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, composed: true, cancelable: true })
+            );
+          } catch (error) {
+            /* ignore */
+          }
+          var escaped = await escapePending;
+          assert('escape-message', !!escaped, 'no escape message');
+
+          // 8. popstate -> runtime re-posts ready
+          var readyBefore = 0;
+          for (var readyIndex = 0; readyIndex < seen.length; readyIndex += 1) {
+            if (seen[readyIndex] === 'ready') readyBefore += 1;
+          }
+          try {
+            window.dispatchEvent(new PopStateEvent('popstate'));
+          } catch (error) {
+            /* ignore */
+          }
+          await wait(60);
+          var readyAfter = 0;
+          for (var readyIndex2 = 0; readyIndex2 < seen.length; readyIndex2 += 1) {
+            if (seen[readyIndex2] === 'ready') readyAfter += 1;
+          }
+          assert('popstate-ready', readyAfter > readyBefore, readyBefore + '->' + readyAfter);
+
+          // 9. set-mode:false -> mode ack, markers preserved
+          var offPending = waitForMessage('mode', 1500, function (payload) {
+            return payload && payload.active === false;
+          });
+          window.postMessage({ channel: 'dsh-web-annotator', type: 'set-mode', payload: { active: false } }, '*');
+          var offAck = await offPending;
+          assert('set-mode-off-ack', !!offAck, 'no mode:false ack');
+          await wait(20);
+          assert('set-mode-off-host', host.getAttribute('data-dsh-mode') === '0', 'mode=' + host.getAttribute('data-dsh-mode'));
+          assert(
+            'markers-preserved-on-mode-off',
+            host.getAttribute('data-dsh-markers') === '2',
+            'count=' + host.getAttribute('data-dsh-markers')
+          );
+
+          // 10. clear -> markers gone, mode off
+          var clearPending = waitForMessage('mode', 1500, function (payload) {
+            return payload && payload.active === false;
+          });
+          window.postMessage({ channel: 'dsh-web-annotator', type: 'clear' }, '*');
+          var cleared = await clearPending;
+          assert('clear-mode', !!cleared, 'no mode:false ack');
+          await wait(20);
+          set('markers-after-clear-value', host.getAttribute('data-dsh-markers') || '');
+          assert(
+            'markers-after-clear',
+            host.getAttribute('data-dsh-markers') === '0',
+            'count=' + host.getAttribute('data-dsh-markers')
+          );
+          assert('mode-after-clear', host.getAttribute('data-dsh-mode') === '0', 'mode=' + host.getAttribute('data-dsh-mode'));
+
+          // 11. markers stay interactive outside annotation mode (they are our own 22px UI)
+          window.postMessage(
+            {
+              channel: 'dsh-web-annotator',
+              type: 'set-annotations',
+              payload: {
+                annotations: [{ id: 'a3', number: 1, kind: 'element', rect: { x: 60, y: 60, width: 120, height: 30 } }]
+              }
+            },
+            '*'
+          );
+          await wait(30);
+          var markerOutside = shadowRootEl().querySelector('.dsha-marker');
+          assert('marker-inactive-exists', !!markerOutside, 'no marker outside annotation mode');
+
+          var outsideHoverPending = waitForMessage('marker-hover', 1500, function (payload) {
+            return payload && payload.id === 'a3';
+          });
+          markerOutside.dispatchEvent(new PointerEvent('pointerenter', { bubbles: false, composed: true, pointerType: 'mouse' }));
+          var outsideHover = await outsideHoverPending;
+          assert('marker-hover-inactive', !!outsideHover, 'no marker-hover outside annotation mode');
+
+          var outsideClickPending = waitForMessage('marker-click', 1500, function (payload) {
+            return payload && payload.id === 'a3';
+          });
+          markerOutside.dispatchEvent(new MouseEvent('click', { bubbles: true, composed: true, cancelable: true }));
+          var outsideClick = await outsideClickPending;
+          assert('marker-click-inactive', !!outsideClick, 'no marker-click outside annotation mode');
+
+          var outsideLeavePending = waitForMessage('marker-hover', 1500, function (payload) {
+            return payload && payload.id === null;
+          });
+          markerOutside.dispatchEvent(new PointerEvent('pointerleave', { bubbles: false, composed: true, pointerType: 'mouse' }));
+          var outsideLeave = await outsideLeavePending;
+          assert('marker-hover-cleared', !!outsideLeave, 'marker-hover:null not reported');
+
+          window.postMessage({ channel: 'dsh-web-annotator', type: 'set-annotations', payload: { annotations: [] } }, '*');
+          await wait(30);
+          assert('markers-cleared-final', host.getAttribute('data-dsh-markers') === '0', 'markers not cleared');
+
+          // 12. no runtime errors were reported at any point
+          assert('no-runtime-errors', errors.length === 0, errors.join(' | '));
+          pass();
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <header>
+      <h1>网页批注运行时测试页</h1>
+      <p id="intro">这个页面用于验证 runtime.js 的覆盖层、三类选择手势与 postMessage 协议。</p>
+    </header>
+
+    <section class="card" id="card-1">
+      <h2>示例卡片</h2>
+      <p>卡片内的说明文字，用于验证区域选择（Shift + 拖拽）与元素点击。</p>
+      <div class="row">
+        <button id="save-btn" type="button">保存更改</button>
+        <button id="cancel-btn" type="button">取消</button>
+      </div>
+    </section>
+
+    <section class="card" id="card-2">
+      <h2>文本选择</h2>
+      <p id="para-1">批注运行时会先把用户的选择转换成结构化 anchor，再通过 postMessage 发送给父窗口。选中这段文字可以验证文本选择路径。</p>
+    </section>
+
+    <footer><p>页脚文本。</p></footer>
+
+    <script src="../runtime.js"></script>
+  </body>
+</html>
