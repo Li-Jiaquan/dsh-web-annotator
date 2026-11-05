@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>DSH Web Annotator — capture benchmark fixture</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+      }
+      body {
+        background: linear-gradient(180deg, #f8fafc 0%, #eef2ff 40%, #fde68a 100%);
+        color: #1f2937;
+        font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      }
+      .row {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 8px 16px;
+        background: rgba(255, 255, 255, 0.55);
+        border-bottom: 1px solid #e5e7eb;
+      }
+      .box {
+        flex: 0 0 auto;
+        width: 240px;
+        height: 120px;
+        background: linear-gradient(135deg, #e0e7ff, #c7d2fe 60%, #a5b4fc);
+        border: 1px solid #c7d2fe;
+      }
+      .row img {
+        flex: 0 0 auto;
+        width: 160px;
+        height: 80px;
+        display: block;
+      }
+      .txt {
+        flex: 1 1 auto;
+        min-width: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="fixture"></div>
+    <script>
+      /* Deterministic long fixture: 40 rows (~4520px tall) and 40 local images. */
+      (function () {
+        'use strict';
+        var rows = [];
+        for (var index = 1; index <= 40; index += 1) {
+          rows.push(
+            '<div class="row" id="row' + index + '">' +
+              '<div class="box" id="box' + index + '"></div>' +
+              '<img id="img' + index + '" src="/img/' + index + '.png" width="160" height="80" alt="local ' + index + '" />' +
+              '<div class="txt" id="text' + index + '">行 ' + index + '：本地图片与文本，用于整页截图性能基准测试。</div>' +
+            '</div>'
+          );
+        }
+        document.getElementById('fixture').innerHTML = rows.join('');
+      })();
+    </script>
+    <script src="/vendor/html2canvas.min.js"></script>
+    <script>
+      /*
+       * Benchmark harness. Runs BEFORE runtime.js so it can wrap html2canvas
+       * (the runtime reuses window.html2canvas when present) and track every
+       * canvas allocated during the measured captures.
+       *
+       * Node drives this through CDP: `window.__benchRun()` resolves with the
+       * measurement object; the same numbers are mirrored into data-bench-*.
+       */
+      (function () {
+        'use strict';
+
+        var htmlEl = document.documentElement;
+        var bench = {
+          canvases: [],
+          captures: [],
+          errors: [],
+          lastCanvas: null,
+          maxCanvasPixels: 0,
+          bigCanvases: []
+        };
+        window.__bench = bench;
+
+        /* Record every canvas size change (released canvases go to 0, so the
+           peak must be sampled when width/height are actually set). */
+        function noteCanvas(canvas) {
+          var pixels = (canvas.width || 0) * (canvas.height || 0);
+          if (pixels > bench.maxCanvasPixels) bench.maxCanvasPixels = pixels;
+          if (pixels >= 1000000 && bench.bigCanvases.indexOf(canvas) < 0) bench.bigCanvases.push(canvas);
+        }
+
+        (function installCanvasSizeTracking() {
+          try {
+            var proto = window.HTMLCanvasElement && window.HTMLCanvasElement.prototype;
+            if (!proto) return;
+            ['width', 'height'].forEach(function (property) {
+              var descriptor = Object.getOwnPropertyDescriptor(proto, property);
+              if (!descriptor || !descriptor.get || !descriptor.set) return;
+              Object.defineProperty(proto, property, {
+                configurable: true,
+                enumerable: descriptor.enumerable,
+                get: function () {
+                  return descriptor.get.call(this);
+                },
+                set: function (value) {
+                  descriptor.set.call(this, value);
+                  noteCanvas(this);
+                }
+              });
+            });
+          } catch (error) {
+            bench.errors.push('canvas tracking unavailable: ' + ((error && error.message) || String(error)));
+          }
+        })();
+
+        function setAttr(name, value) {
+          try {
+            htmlEl.setAttribute('data-bench-' + name, String(value));
+          } catch (error) {
+            /* ignore */
+          }
+        }
+
+        function wait(ms) {
+          return new Promise(function (resolve) {
+            setTimeout(resolve, ms);
+          });
+        }
+
+        function pageRect(element) {
+          var rect = element.getBoundingClientRect();
+          var sx = window.scrollX || window.pageXOffset || 0;
+          var sy = window.scrollY || window.pageYOffset || 0;
+          return {
+            x: Math.round(rect.left + sx),
+            y: Math.round(rect.top + sy),
+            width: Math.round(rect.width),
+            height: Math.round(rect.height)
+          };
+        }
+
+        function bytesOf(dataUrl) {
+          if (typeof dataUrl !== 'string') return 0;
+          var comma = dataUrl.indexOf(',');
+          if (comma < 0) return dataUrl.length;
+          return Math.floor(((dataUrl.length - comma - 1) * 3) / 4);
+        }
+
+        function capture(requestId, ids) {
+          return new Promise(function (resolve) {
+            var timer = setTimeout(function () {
+              window.removeEventListener('message', onMessage);
+              resolve(null);
+            }, 60000);
+            function onMessage(event) {
+              var data = event.data;
+              if (!data || data.channel !== 'dsh-web-annotator') return;
+              if (data.type !== 'screenshots' || data.requestId !== requestId) return;
+              window.removeEventListener('message', onMessage);
+              clearTimeout(timer);
+              resolve(data);
+            }
+            window.addEventListener('message', onMessage);
+            window.postMessage(
+              {
+                channel: 'dsh-web-annotator',
+                type: 'capture-screenshots',
+                requestId: requestId,
+                ids: ids,
+                options: { mode: 'full' }
+              },
+              '*'
+            );
+          });
+        }
+
+        /* Track canvas allocations (the runtime + html2canvas both create them). */
+        var realCreateElement = document.createElement.bind(document);
+        document.createElement = function (tag) {
+          var element = realCreateElement(tag);
+          if (String(tag).toLowerCase() === 'canvas') bench.canvases.push(element);
+          return element;
+        };
+
+        /* Wrap html2canvas so we can read the real render canvas size/time. */
+        var realHtml2Canvas = window.html2canvas;
+        if (typeof realHtml2Canvas !== 'function') {
+          bench.errors.push('html2canvas missing before runtime');
+        } else {
+          window.html2canvas = function (element, options) {
+            var started = performance.now();
+            var scale = options && options.scale;
+            return Promise.resolve(realHtml2Canvas(element, options)).then(function (canvas) {
+              bench.lastCanvas = {
+                width: canvas.width,
+                height: canvas.height,
+                pixels: canvas.width * canvas.height,
+                ms: performance.now() - started,
+                scale: scale
+              };
+              return canvas;
+            });
+          };
+        }
+
+        async function run() {
+          try {
+            var pageWidth = Math.max(1, Math.ceil(htmlEl.scrollWidth));
+            var pageHeight = Math.max(1, Math.ceil(htmlEl.scrollHeight));
+            setAttr('page-size', pageWidth + 'x' + pageHeight);
+            bench.pageSize = { width: pageWidth, height: pageHeight };
+
+            var overlayDeadline = Date.now() + 15000;
+            while (!document.getElementById('dsh-web-annotator-root') && Date.now() < overlayDeadline) {
+              await wait(50);
+            }
+            if (!document.getElementById('dsh-web-annotator-root')) throw new Error('runtime overlay missing');
+            await wait(150);
+
+            var annotations = [];
+            var ids = [];
+            for (var index = 1; index <= 12; index += 1) {
+              var element = document.getElementById(index % 2 === 0 ? 'img' + index : 'box' + index);
+              var rect = pageRect(element);
+              ids.push('b' + index);
+              annotations.push({ id: 'b' + index, number: index, kind: 'element', rect: rect });
+            }
+            window.postMessage(
+              { channel: 'dsh-web-annotator', type: 'set-annotations', payload: { annotations: annotations } },
+              '*'
+            );
+            await wait(100);
+
+            // Warm-up capture (html2canvas lazy init, image decode caches, JIT) — not measured.
+            var warmup = await capture('bench-warmup', ids);
+            if (!warmup || !warmup.items || warmup.items.length === 0) {
+              throw new Error('warm-up capture failed: ' + JSON.stringify(warmup && warmup.failed ? warmup.failed : warmup));
+            }
+            bench.canvases.length = 0;
+            bench.maxCanvasPixels = 0;
+            bench.bigCanvases = [];
+
+            for (var round = 1; round <= 3; round += 1) {
+              bench.lastCanvas = null;
+              var startedAt = performance.now();
+              var shot = await capture('bench-' + round, ids);
+              var elapsed = performance.now() - startedAt;
+              var item = shot && shot.items && shot.items[0];
+              if (!item || item.id !== '__page__') throw new Error('capture ' + round + ' failed');
+              var canvasInfo = bench.lastCanvas;
+              var record = {
+                round: round,
+                captureMs: Math.round(elapsed * 10) / 10,
+                renderMs: canvasInfo ? Math.round(canvasInfo.ms * 10) / 10 : 0,
+                canvas: canvasInfo
+                  ? { width: canvasInfo.width, height: canvasInfo.height, pixels: canvasInfo.pixels, scale: canvasInfo.scale }
+                  : null,
+                output: { width: item.width, height: item.height },
+                bytes: bytesOf(item.dataUrl)
+              };
+              bench.captures.push(record);
+              setAttr('capture-ms-' + round, Math.round(elapsed));
+              setAttr('render-ms-' + round, record.renderMs);
+              setAttr('canvas-px-' + round, record.canvas ? record.canvas.pixels : 0);
+              setAttr('canvas-size-' + round, record.canvas ? record.canvas.width + 'x' + record.canvas.height : 'none');
+              setAttr('canvas-scale-' + round, record.canvas && record.canvas.scale != null ? record.canvas.scale : 'none');
+              setAttr('out-size-' + round, item.width + 'x' + item.height);
+              setAttr('bytes-' + round, record.bytes);
+              await wait(80);
+            }
+
+            var maxPixels = bench.maxCanvasPixels;
+            var bigCount = bench.bigCanvases.length;
+            bench.bigCanvasCount = bigCount;
+            bench.createdCanvasCount = bench.canvases.length;
+            setAttr('max-canvas-px', maxPixels);
+            setAttr('big-canvas-count', bigCount);
+            setAttr('created-canvas-count', bench.canvases.length);
+            setAttr('status', 'pass');
+            return bench;
+          } catch (error) {
+            var message = (error && error.message) || String(error);
+            setAttr('status', 'fail');
+            setAttr('error', message);
+            bench.errors.push(message);
+            return { status: 'fail', error: message, bench: bench };
+          }
+        }
+
+        window.__benchRun = run;
+      })();
+    </script>
+    <script src="/runtime.js"></script>
+  </body>
+</html>

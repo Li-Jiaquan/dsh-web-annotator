@@ -19,6 +19,7 @@ window.__ModuleLoader__.load({
     const h = React.createElement;
     const useCallback = React.useCallback;
     const useEffect = React.useEffect;
+    const useMemo = React.useMemo;
     const useRef = React.useRef;
     const useState = React.useState;
 
@@ -44,6 +45,14 @@ window.__ModuleLoader__.load({
       'navigate',
     ];
     const PARENT_TO_PAGE = ['hello', 'set-mode', 'set-annotations', 'focus-annotation', 'clear', 'capture-screenshots'];
+    /**
+     * Inbound vocabulary as a Set: the message listener runs for every
+     * page-side pointer/hover message, so membership must stay O(1) and
+     * non-contract traffic must bail out before touching React state.
+     */
+    const INBOUND_TYPES = new Set(PAGE_TO_PARENT);
+    /** Types the parent intentionally ignores (page-side-only marker feedback). */
+    const NOOP_INBOUND_TYPES = new Set(['marker-hover', 'marker-click']);
     /** v1.3 screenshot capture: response deadline and the single full-page shot. */
     const SCREENSHOT_TIMEOUT_MS = 15000;
     const PAGE_SCREENSHOT_ID = '__page__';
@@ -404,13 +413,19 @@ window.__ModuleLoader__.load({
       var maxBytes = 4 * 1024 * 1024;
       if (typeof dataUrl !== 'string') return null;
       if (dataUrl.slice(0, prefix.length) !== prefix) return null;
-      var payload = dataUrl.slice(prefix.length).replace(/\s+/g, '');
+      var payload = dataUrl.slice(prefix.length);
       if (payload === '') return null;
       var binary;
       try {
+        // Base64 payloads from the runtime are already whitespace-free; only
+        // fall back to a full-string cleanup for unusual encoders.
         binary = atob(payload);
       } catch (error) {
-        return null;
+        try {
+          binary = atob(payload.replace(/\s+/g, ''));
+        } catch (inner) {
+          return null;
+        }
       }
       if (binary.length === 0 || binary.length > maxBytes) return null;
       var bytes = new Uint8Array(binary.length);
@@ -1096,8 +1111,11 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         const handleMessage = function (event) {
           const data = event && event.data;
+          // Fast bail-outs: unrelated window messages (and page-side-only
+          // pointer feedback) never reach origin checks or React state.
           if (!data || typeof data !== 'object' || data.channel !== CHANNEL) return;
-          if (PAGE_TO_PARENT.indexOf(data.type) < 0) return;
+          if (!INBOUND_TYPES.has(data.type)) return;
+          if (NOOP_INBOUND_TYPES.has(data.type)) return;
           const frame = iframeRef.current;
           const endpointNow = endpointRef.current;
           if (!frame || !endpointNow || endpointNow.origin === '') return;
@@ -1185,11 +1203,6 @@ window.__ModuleLoader__.load({
               if (typeof submit === 'function') submit();
               break;
             }
-            case 'marker-hover':
-            case 'marker-click': {
-              // No panel list in v1.2; marker interactions stay page-side.
-              break;
-            }
             case 'escape': {
               modeRef.current = false;
               setMode(false);
@@ -1227,21 +1240,28 @@ window.__ModuleLoader__.load({
         if (frameReady) sendToFrame('set-mode', { active: mode });
       }, [mode, frameReady, sendToFrame]);
 
-      const markerSignature = annotations
-        .map(function (annotation, index) {
-          const rect = annotation.rect;
-          return [
-            annotation.id,
-            index + 1,
-            annotation.kind,
-            rect.x,
-            rect.y,
-            rect.width,
-            rect.height,
-            annotation.selectedText || '',
-          ].join(':');
-        })
-        .join('|');
+      // Marker signature drives the marker-push effect; memoized so typing in
+      // the address bar / status changes do not rebuild it every render.
+      const markerSignature = useMemo(
+        function () {
+          return annotations
+            .map(function (annotation, index) {
+              const rect = annotation.rect;
+              return [
+                annotation.id,
+                index + 1,
+                annotation.kind,
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height,
+                annotation.selectedText || '',
+              ].join(':');
+            })
+            .join('|');
+        },
+        [annotations],
+      );
 
       // Keep the mirror reachable from the once-registered message listener.
       // Comments change the mirror without changing the marker signature, so
@@ -1277,31 +1297,48 @@ window.__ModuleLoader__.load({
         };
       }, []);
 
-      const frameSrc =
-        endpoint.phase === 'ready' && endpoint.origin !== '' && targetUrl !== ''
-          ? endpoint.origin +
+      // Iframe source: a stable memo keyed only by navigation state. Ordinary
+      // updates (URL typing, status text, annotations, notices, loading flags)
+      // cannot change it, so React never rewrites `src` and never remounts the
+      // frame. `reloadToken` is the deliberate one-shot reload cache-bust.
+      const frameSrc = useMemo(
+        function () {
+          if (endpoint.phase !== 'ready' || endpoint.origin === '' || targetUrl === '') return '';
+          return (
+            endpoint.origin +
             PROXY_PATH +
             '?url=' +
             encodeURIComponent(targetUrl) +
             (targetAuto ? '&auto=1' : '') +
             (reloadToken > 0 ? '&_r=' + reloadToken : '')
-          : '';
+          );
+        },
+        [endpoint.phase, endpoint.origin, targetUrl, targetAuto, reloadToken],
+      );
       const frameLoaded = frameSrc !== '';
       // v1.6 (SPEC.md §15.1): history-aware disabled states for the nav buttons.
       const canGoBack = history.index > 0;
       const canGoForward = history.index >= 0 && history.index < history.entries.length - 1;
       const canReload = targetUrl !== '' || history.index >= 0;
 
-      const handleFrameLoad = function () {
-        frameReadyRef.current = false;
-        setFrameReady(false);
-        sendToFrame('hello');
-      };
+      // Stable frame handlers: with a memoized src/key and stable callbacks,
+      // panel re-renders reconcile the iframe without touching its DOM props.
+      const handleFrameLoad = useCallback(
+        function () {
+          frameReadyRef.current = false;
+          setFrameReady(false);
+          sendToFrame('hello');
+        },
+        [sendToFrame],
+      );
 
-      const handleFrameError = function () {
-        setPageLoading(false);
-        setActionError(t('error.iframe'));
-      };
+      const handleFrameError = useCallback(
+        function () {
+          setPageLoading(false);
+          setActionError(t('error.iframe'));
+        },
+        [t],
+      );
 
       const clearFeedback = function () {
         setActionError('');
@@ -1627,8 +1664,8 @@ window.__ModuleLoader__.load({
       } else if (notice !== '') {
         statusText = notice;
       }
-      // SPEC.md §13.1: "ready"/"annotating" (and the transient page-load line)
-      // are intentionally not rendered; an idle view shows no status text.
+      // SPEC.md §13.1: "ready"/"annotating" are intentionally not rendered; an
+      // idle view shows no status text (the page-load line is transient).
 
       const placeholderText =
         endpoint.phase === 'loading'
@@ -1638,6 +1675,9 @@ window.__ModuleLoader__.load({
               ? t('error.endpoint', { status: endpoint.status })
               : t('error.endpointNetwork', { message: endpoint.message || 'network error' })
             : t('placeholder.hint');
+
+      // One localized string per render (used for both the title and the label).
+      const sendLabel = t('toolbar.send', { count: annotations.length });
 
       return h(
         'div',
@@ -1774,10 +1814,10 @@ window.__ModuleLoader__.load({
               className: 'dsha-btn dsha-btn-primary',
               onClick: handleSend,
               disabled: annotations.length === 0 || sending,
-              title: t('toolbar.send', { count: annotations.length }),
+              title: sendLabel,
               'data-dsha-send': '1',
             },
-            t('toolbar.send', { count: annotations.length }),
+            sendLabel,
           ),
           statusText === ''
             ? null

@@ -16,7 +16,7 @@
  */
 
 import { createServer } from 'node:http';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join as joinPath } from 'node:path';
 
@@ -50,6 +50,18 @@ export const DEFAULT_BINARY_LIMIT_BYTES = 20 * 1024 * 1024;
 /** `GET /asset` budget (SPEC §10.2): 10s timeout, 20MB body. */
 export const DEFAULT_ASSET_TIMEOUT_MS = 10_000;
 export const DEFAULT_ASSET_LIMIT_BYTES = 20 * 1024 * 1024;
+
+/** HTTP cache headers (v1.7 performance work). */
+export const VENDOR_CACHE_CONTROL = 'public, max-age=31536000, immutable';
+export const RUNTIME_CACHE_CONTROL = 'no-cache';
+export const ASSET_CACHE_CONTROL = 'private, max-age=60';
+
+/** `/asset` in-memory LRU cache limits (v1.7). */
+export const DEFAULT_ASSET_CACHE_MAX_ENTRIES = 64;
+export const DEFAULT_ASSET_CACHE_MAX_BYTES = 24 * 1024 * 1024;
+export const DEFAULT_ASSET_CACHE_TTL_MS = 120_000;
+export const DEFAULT_ASSET_CACHE_MAX_ENTRY_BYTES = 4 * 1024 * 1024;
+
 const DEFAULT_URL_MAX_LENGTH = 8192;
 const ALLOWED_PROTOCOLS = ['http:', 'https:'];
 
@@ -182,6 +194,11 @@ export function escapeHtmlText(value) {
  *   binaryLimitBytes?: number,
  *   assetTimeoutMs?: number,
  *   assetLimitBytes?: number,
+ *   assetCacheMaxEntries?: number,
+ *   assetCacheMaxBytes?: number,
+ *   assetCacheTtlMs?: number,
+ *   assetCacheMaxEntryBytes?: number,
+ *   runtimeFilePath?: string | URL,
  * }} [options]
  */
 export function createAnnotatorServer(options = {}) {
@@ -196,8 +213,21 @@ export function createAnnotatorServer(options = {}) {
     binaryLimitBytes: positiveNumber(options?.binaryLimitBytes, DEFAULT_BINARY_LIMIT_BYTES),
     assetTimeoutMs: positiveNumber(options?.assetTimeoutMs, DEFAULT_ASSET_TIMEOUT_MS),
     assetLimitBytes: positiveNumber(options?.assetLimitBytes, DEFAULT_ASSET_LIMIT_BYTES),
+    assetCacheMaxEntries: positiveNumber(
+      options?.assetCacheMaxEntries,
+      DEFAULT_ASSET_CACHE_MAX_ENTRIES,
+    ),
+    assetCacheMaxBytes: positiveNumber(
+      options?.assetCacheMaxBytes,
+      DEFAULT_ASSET_CACHE_MAX_BYTES,
+    ),
+    assetCacheTtlMs: positiveNumber(options?.assetCacheTtlMs, DEFAULT_ASSET_CACHE_TTL_MS),
+    assetCacheMaxEntryBytes: positiveNumber(
+      options?.assetCacheMaxEntryBytes,
+      DEFAULT_ASSET_CACHE_MAX_ENTRY_BYTES,
+    ),
   };
-  const runtimeFilePath = new URL('./runtime.js', import.meta.url);
+  const runtimeFilePath = resolveRuntimeFilePath(options?.runtimeFilePath);
   const vendorFilePath = new URL('./vendor/html2canvas.min.js', import.meta.url);
 
   const server = createServer((req, res) => {
@@ -234,7 +264,8 @@ export function createAnnotatorServer(options = {}) {
     return '';
   }
 
-  function runtimeSourceText() {
+  /** Text of an injected `runtimeSource` (tests/stubs); empty when not injected. */
+  function injectedRuntimeSourceText() {
     const source = config.runtimeSource;
     if (Buffer.isBuffer(source)) return source.toString('utf8');
     if (typeof source === 'string') return source;
@@ -245,7 +276,31 @@ export function createAnnotatorServer(options = {}) {
       }
       return Buffer.isBuffer(produced) ? produced.toString('utf8') : String(produced ?? '');
     }
-    return readFileSync(runtimeFilePath, 'utf8');
+    return '';
+  }
+
+  let runtimeFileCache = null; // { key, source, etag }
+
+  /**
+   * Runtime source plus a strong ETag. File-backed sources are cached by
+   * mtime+size (v1.7): the file is only re-read when it changes on disk.
+   * Injected sources (tests/stubs) bypass the file cache and carry no ETag.
+   *
+   * @returns {{ source: string, etag: string }}
+   */
+  function loadRuntimeSource() {
+    if (config.runtimeSource != null) {
+      return { source: injectedRuntimeSourceText(), etag: '' };
+    }
+    const stats = statSync(runtimeFilePath);
+    const key = `${stats.mtimeMs}:${stats.size}`;
+    if (runtimeFileCache && runtimeFileCache.key === key) return runtimeFileCache;
+    runtimeFileCache = {
+      key,
+      source: readFileSync(runtimeFilePath, 'utf8'),
+      etag: `"${stats.size.toString(16)}-${Math.floor(stats.mtimeMs).toString(16)}"`,
+    };
+    return runtimeFileCache;
   }
 
   /** Absolute URL: `<base href>` makes root-relative srcs resolve to the target. */
@@ -307,14 +362,25 @@ export function createAnnotatorServer(options = {}) {
   }
 
   function serveRuntime(req, res) {
-    let source;
+    let entry;
     try {
-      source = runtimeSourceText();
+      entry = loadRuntimeSource();
     } catch {
       sendJson(req, res, 503, { ok: false, error: 'runtime.js is not available yet' });
       return;
     }
-    writeResponse(req, res, 200, { 'content-type': 'application/javascript; charset=utf-8' }, source);
+    const headers = {
+      'content-type': 'application/javascript; charset=utf-8',
+      'cache-control': RUNTIME_CACHE_CONTROL,
+    };
+    if (entry.etag) {
+      headers.etag = entry.etag;
+      if (etagMatches(req?.headers?.['if-none-match'], entry.etag)) {
+        sendNotModified(res, headers);
+        return;
+      }
+    }
+    writeResponse(req, res, 200, headers, entry.source);
   }
 
   /** Bytes of the vendored html2canvas build (SPEC §10.2). */
@@ -344,7 +410,16 @@ export function createAnnotatorServer(options = {}) {
       });
       return;
     }
-    writeResponse(req, res, 200, { 'content-type': 'application/javascript; charset=utf-8' }, source);
+    writeResponse(
+      req,
+      res,
+      200,
+      {
+        'content-type': 'application/javascript; charset=utf-8',
+        'cache-control': VENDOR_CACHE_CONTROL,
+      },
+      source,
+    );
   }
 
   /** One `/proxy` fetch attempt with the contract headers and timeout budget. */
@@ -487,6 +562,52 @@ export function createAnnotatorServer(options = {}) {
     sendHtmlDocument(req, res, buffer.toString('utf8'), finalUrl);
   }
 
+  // --- /asset in-memory LRU cache (v1.7) --------------------------------
+  /** @type {Map<string, { buffer: Buffer, contentType: string, expiresAt: number }>} */
+  const assetCache = new Map();
+  let assetCacheBytes = 0;
+
+  function assetCacheDelete(url) {
+    const existing = assetCache.get(url);
+    if (!existing) return;
+    assetCache.delete(url);
+    assetCacheBytes -= existing.buffer.byteLength;
+  }
+
+  function assetCacheGet(url) {
+    const entry = assetCache.get(url);
+    if (!entry) return null;
+    if (entry.expiresAt <= Date.now()) {
+      assetCacheDelete(url);
+      return null;
+    }
+    // Refresh recency: delete + re-insert moves the key to the end (LRU).
+    assetCache.delete(url);
+    assetCache.set(url, entry);
+    return entry;
+  }
+
+  function assetCachePut(url, buffer, contentType) {
+    // Only complete 200 responses below the per-entry cap were passed in.
+    if (buffer.byteLength > config.assetCacheMaxEntryBytes) return;
+    assetCacheDelete(url);
+    assetCache.set(url, {
+      buffer,
+      contentType,
+      expiresAt: Date.now() + config.assetCacheTtlMs,
+    });
+    assetCacheBytes += buffer.byteLength;
+    while (
+      (assetCache.size > config.assetCacheMaxEntries ||
+        assetCacheBytes > config.assetCacheMaxBytes) &&
+      assetCache.size > 0
+    ) {
+      const oldest = assetCache.keys().next();
+      if (oldest.done) break;
+      assetCacheDelete(oldest.value);
+    }
+  }
+
   /**
    * `GET /asset?url=...` (SPEC §10.2): same-origin fetch of a remote static
    * asset for the injected runtime (html2canvas proxy). Unlike `/proxy` this
@@ -512,6 +633,18 @@ export function createAnnotatorServer(options = {}) {
       return;
     }
     const targetUrl = normalized.url.href;
+
+    const cached = assetCacheGet(targetUrl);
+    if (cached) {
+      writeResponse(
+        req,
+        res,
+        200,
+        { 'content-type': cached.contentType, 'cache-control': ASSET_CACHE_CONTROL },
+        cached.buffer,
+      );
+      return;
+    }
 
     let response;
     try {
@@ -549,11 +682,20 @@ export function createAnnotatorServer(options = {}) {
 
     try {
       const buffer = await readResponseBuffer(response, config.assetLimitBytes);
+      const responseContentType = contentTypeHeader || 'application/octet-stream';
+      // Only complete 200 responses are cacheable; >4MB entries are skipped by
+      // assetCachePut itself (v1.7 limits). Error statuses stay no-store.
+      if (response.status === 200) {
+        assetCachePut(targetUrl, buffer, responseContentType);
+      }
       writeResponse(
         req,
         res,
         response.status,
-        { 'content-type': contentTypeHeader || 'application/octet-stream' },
+        {
+          'content-type': responseContentType,
+          'cache-control': response.status === 200 ? ASSET_CACHE_CONTROL : 'no-store',
+        },
         buffer,
       );
     } catch (error) {
@@ -1029,6 +1171,45 @@ class BodyTooLargeError extends Error {
 
 function positiveNumber(value, fallback) {
   return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+/** Resolve the runtime.js file path override (tests use a temp file). */
+function resolveRuntimeFilePath(value) {
+  if (value && typeof value === 'object' && typeof value.href === 'string') {
+    return new URL(value.href);
+  }
+  if (typeof value === 'string' && value !== '') return value;
+  return new URL('./runtime.js', import.meta.url);
+}
+
+/** True when an `If-None-Match` header lists the given strong ETag. */
+function etagMatches(headerValue, etag) {
+  if (typeof headerValue !== 'string' || headerValue.trim() === '') return false;
+  return headerValue
+    .split(',')
+    .map((token) => token.trim())
+    .some((token) => token === '*' || token === etag || token === `W/${etag}`);
+}
+
+/** Send a 304 with the given validators and no body (v1.7 runtime.js). */
+function sendNotModified(res, headers) {
+  try {
+    if (typeof res.writeHead === 'function') {
+      res.writeHead(304, headers);
+    } else {
+      if (typeof res.setHeader === 'function') {
+        for (const [name, value] of Object.entries(headers)) res.setHeader(name, value);
+      }
+      res.statusCode = 304;
+    }
+    res.end();
+  } catch {
+    try {
+      res.destroy();
+    } catch {
+      /* already gone */
+    }
+  }
 }
 
 function messageOf(error) {

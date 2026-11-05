@@ -2453,11 +2453,31 @@
     }
   }
 
+  /**
+   * PNG byte count from the dataURL length only: never atob/base64-decode the
+   * whole payload (that would allocate another copy of the image). Exact for
+   * valid base64 (minus '=' padding bytes).
+   */
   function dataUrlBytes(dataUrl) {
     var text = String(dataUrl == null ? '' : dataUrl);
     var comma = text.indexOf(',');
     if (comma < 0) return text.length;
-    return Math.floor(((text.length - comma - 1) * 3) / 4);
+    var payloadLength = text.length - comma - 1;
+    var padding = 0;
+    if (text.charAt(text.length - 1) === '=') padding += 1;
+    if (text.charAt(text.length - 2) === '=') padding += 1;
+    return Math.max(0, Math.floor((payloadLength * 3) / 4) - padding);
+  }
+
+  /** Drop a large canvas' backing store as soon as it is no longer needed. */
+  function releaseCanvas(canvas) {
+    if (!canvas) return;
+    try {
+      canvas.width = 0;
+      canvas.height = 0;
+    } catch (error) {
+      /* ignore */
+    }
   }
 
   function captureNumber(value, fallback) {
@@ -2565,6 +2585,15 @@
     var renderScale = captureNumber(options.scale, 1);
     if (!(renderScale > 0)) renderScale = 1;
     renderScale = clamp(renderScale, 0.1, 2);
+    // v1.7: full mode renders directly at the final long-edge budget instead of
+    // rendering huge pages at 1x and downsampling afterwards. Output size is
+    // unchanged (still <= FULL_MAX_LONG_EDGE), render pixels drop sharply.
+    if (mode === 'full') {
+      var fullLongEdge = Math.max(pageWidth, pageHeight);
+      if (fullLongEdge > FULL_MAX_LONG_EDGE) {
+        renderScale = Math.min(renderScale, FULL_MAX_LONG_EDGE / fullLongEdge);
+      }
+    }
     var renderPixels = pageWidth * pageHeight * renderScale * renderScale;
     if (renderPixels > SHOT_MAX_RENDER_PIXELS) {
       // Safety valve for very tall pages: lower the render scale, not the output size.
@@ -2610,6 +2639,7 @@
     var canvasWidth = canvas && canvas.width ? canvas.width : 0;
     var canvasHeight = canvas && canvas.height ? canvas.height : 0;
     if (!canvasWidth || !canvasHeight) {
+      releaseCanvas(canvas);
       var emptyRender = [];
       for (var e = 0; e < ids.length; e += 1) emptyRender.push({ id: idText(ids[e]), error: 'render-failed' });
       postScreenshots(requestId, [], emptyRender);
@@ -2620,6 +2650,7 @@
 
     if (mode === 'full') {
       var fullImage = buildFullPageImage(canvas, plan, scaleX, scaleY);
+      releaseCanvas(canvas);
       if (!fullImage || fullImage.error) {
         for (var fp = 0; fp < plan.length; fp += 1) {
           failed.push({ id: plan[fp].id, error: (fullImage && fullImage.error) || 'full-render-failed' });
@@ -2661,6 +2692,7 @@
       }
     }
 
+    releaseCanvas(canvas);
     postScreenshots(requestId, items, failed);
   }
 
@@ -2669,8 +2701,12 @@
    * ------------------------------------------------------------------ */
 
   /**
-   * Draw every valid annotation onto a copy of the whole-page render and
-   * return one PNG (long edge <= 2400px, <= 3MB, fixed id `__page__`).
+   * Draw every valid annotation directly onto the whole-page render and return
+   * one PNG (long edge <= 2400px, <= 3MB, fixed id `__page__`).
+   *
+   * v1.7: no intermediate source-sized canvas copy — the render canvas itself is
+   * annotated in place, then downsampled/encoded from it. Callers release the
+   * render canvas as soon as this returns, halving peak canvas memory.
    */
   function buildFullPageImage(sourceCanvas, plan, scaleX, scaleY) {
     try {
@@ -2680,12 +2716,18 @@
       var longEdge = Math.max(sourceWidth, sourceHeight);
       var outScale = longEdge > FULL_MAX_LONG_EDGE ? FULL_MAX_LONG_EDGE / longEdge : 1;
 
-      var annotated = document.createElement('canvas');
-      annotated.width = sourceWidth;
-      annotated.height = sourceHeight;
-      var ctx = annotated.getContext('2d');
+      var ctx = sourceCanvas.getContext('2d');
       if (!ctx) return { error: 'canvas-unavailable' };
-      ctx.drawImage(sourceCanvas, 0, 0);
+      // html2canvas leaves its own render scale on the canvas context; reset it
+      // so our annotation coordinates are plain canvas pixels (v1.7 draws on
+      // the render canvas directly, so this is required for correct geometry).
+      try {
+        if (typeof ctx.setTransform === 'function') ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.globalAlpha = 1;
+        ctx.globalCompositeOperation = 'source-over';
+      } catch (error) {
+        /* ignore */
+      }
 
       // Keep the final (post-downscale) stroke/badge sizes exact.
       var strokeWidth = FULL_BORDER_WIDTH / outScale;
@@ -2709,7 +2751,7 @@
 
       var outWidth = Math.max(1, Math.round(sourceWidth * outScale));
       var outHeight = Math.max(1, Math.round(sourceHeight * outScale));
-      var encoded = encodeFull(annotated, outWidth, outHeight);
+      var encoded = encodeFull(sourceCanvas, outWidth, outHeight);
       if (!encoded || encoded.error) return encoded || { error: 'encode-failed' };
 
       var guard = 0;
@@ -2718,7 +2760,7 @@
         var nextWidth = Math.floor(encoded.width * FULL_DOWNSCALE_STEP);
         var nextHeight = Math.floor(encoded.height * FULL_DOWNSCALE_STEP);
         if (Math.max(nextWidth, nextHeight) < FULL_MIN_LONG_EDGE) break;
-        var retry = encodeFull(annotated, nextWidth, nextHeight);
+        var retry = encodeFull(sourceCanvas, nextWidth, nextHeight);
         if (!retry || retry.error) break;
         encoded = retry;
       }

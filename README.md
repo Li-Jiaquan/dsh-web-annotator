@@ -76,6 +76,36 @@
 - 跨源图片通过宿主新增的 `GET /asset?url=` 同源代理取回（`html2canvas` 的 `proxy` 选项），因此截图不会因跨源图片而空白/失败；图片等待上限 4s，过慢的图片会被跳过（截图仍成功）。
 - 裁剪小图模式（`mode:'crop'`）作为内部兼容能力保留，产品默认只用 `full`。
 
+## 性能优化（v1.7）
+
+v1.7 做了一轮性能优化，全部可复现（`node test/bench.capture.mjs`、`node test/bench.host.mjs`），行为/协议/截图尺寸不变：
+
+**截图捕获（runtime）**
+- 整页长边 >2400px 时，**直接按最终输出分辨率渲染**（`scale = min(1, 2400/长边)`），不再 1x 渲染超大长页再降采样；输出图尺寸不变、边缘略更锐利。
+- 去掉一张**全尺寸中间 canvas**：把批注红框/编号直接画在 html2canvas 产出的 canvas 上再编码；修正了 html2canvas 在返回 canvas 上残留变换的问题，框线位置/粗细与之前一致。
+- 大 canvas 用完立即释放，减少峰值内存。
+
+实测（同一长页 fixture 784×5560、40 张图、12 批注，5 轮 A/B 中位）：
+
+| 指标 | 优化前 | 优化后 | 变化 |
+|---|---|---|---|
+| capture 中位耗时 | 257.0 ms | 224.8 ms | −12.5% |
+| 构建+编码开销 | 42.0 ms | 16.3 ms | −61% |
+| 渲染像素数 | 4,359,040 | 811,200 | −81.4%（5.37×） |
+| runtime 自有峰值 canvas | ≈9.5 MP | ≈1.6 MP | −83% |
+
+**宿主代理（host）**
+- `/asset` 增加 LRU 内存缓存（64 条 / 24MB / TTL 120s，仅缓存 200 且 ≤4MB 的响应）：同一批跨源图片在重复截图时直接命中，单张命中耗时约 **13.1ms → 5.4ms（2.4–2.9×）**，上游请求次数 **2 → 1**。
+- `/vendor/html2canvas.min.js` 返回 `Cache-Control: public, max-age=31536000, immutable`，重复打开页面不再重复下载/解析 198KB 资源。
+- `/runtime.js` 返回 `Cache-Control: no-cache` + 强 `ETag`，命中返回 **304 空体**；文件读取按 mtime+size 缓存，steady 请求约 **3.5ms → 2.8ms**。
+- `/proxy` 路径未改（50 次平均约 2.5ms），无回归。
+
+**客户端（client）**
+- 确认普通状态更新（输入地址、状态栏、批注镜像、按钮状态等）**不会重载 iframe**；`src`/回调等 props 改为 memo/useCallback 稳定引用。
+- 消息处理加了快速返回（非本视图消息在 channel 判断后立即返回；`screenshot` 大响应先校验 requestId 再解码），并去掉大 base64 串在常见路径上的全串替换。
+
+> 缓存说明：`/asset` 是内存缓存，TTL 120s —— 如果你在 2 分钟内更新了同一张跨源图片再截图，可能仍看到旧图；重启 DSH 或等过期即可。页面 HTML 不缓存（保持最新）。
+
 ## 安全与限制（v1.1）
 
 - 页面经宿主插件在 **独立 origin（127.0.0.1 随机端口）** 代理后放入 iframe，与 Harness GUI 隔离；只允许 http/https，15s 超时、HTML 5MB 上限。
@@ -89,12 +119,16 @@
 
 ```
 node --check index.js client.js runtime.js
-node test/host.test.mjs          # 11/11 宿主代理、endpoint、/vendor、/asset、协议回退、最终 URL/base/meta
-node test/client.static.mjs      # 22/22 客户端外壳/槽注册/协议/模板/草稿写入/整页截图/地址栏推断/导航/浏览器历史
+node test/host.test.mjs          # 12/12 宿主代理、endpoint、/vendor、/asset（含缓存/ETag）、协议回退、最终 URL/base/meta
+node test/client.static.mjs      # 23/23 客户端外壳/槽注册/协议/模板/草稿写入/整页截图/地址栏/导航/浏览器历史/渲染性能
 node test/runtime-check.mjs      # 73/73 运行时契约 + headless Chrome 端到端手势
-node test/runtime.screenshot.mjs # 98/98 整页标注截图 + 链接 navigate/ready-url 端到端
+node test/runtime.screenshot.mjs # 100/100 整页标注截图 + 链接 navigate/ready-url + 渲染分辨率自适应
 node test/runtime.comments.mjs   # 93/93 空格穿透 + 悬浮评论窗/写入对话框浮动条/清空同步
 node test/accept.mjs             # 22/22 Lead 验收：清单/图标/语法/协议一致性/宿主集成/路由/契约
+
+# 性能基准（无需网络）
+node test/bench.capture.mjs      # 长页截图捕获：capture/render 耗时、渲染像素、canvas 内存
+node test/bench.host.mjs         # 宿主：/asset 缓存命中、/runtime.js 读取、/proxy 吞吐
 ```
 
 接口契约见 `SPEC.md`（冻结）：§0-§9 为 v1.0 基础协议，§10 为 v1.1 截图附件，§11 为 v1.2 页面内悬浮评论窗交互，§12 为 v1.3 空格穿透 + 整页标注截图，§13 为 v1.4 状态栏精简 + 写入对话框，§14 为 v1.5 地址栏自动协议 + 链接跳转，§15 为 v1.6 浏览器式 后退/前进/刷新。

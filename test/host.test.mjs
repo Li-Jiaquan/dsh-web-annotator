@@ -7,6 +7,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { unlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import {
   apply,
@@ -15,12 +18,15 @@ import {
   escapeHtmlText,
   inject,
   normalizeTargetUrl,
+  ASSET_CACHE_CONTROL,
   ASSET_PATH,
   ENDPOINT_PATH,
   HEALTH_PATH,
   PROXY_PATH,
+  RUNTIME_CACHE_CONTROL,
   RUNTIME_PATH,
   TARGET_URL_META_NAME,
+  VENDOR_CACHE_CONTROL,
   VENDOR_PATH,
   VENDOR_PREFIX,
 } from '../index.js';
@@ -36,6 +42,8 @@ const PAGE_HTML =
 
 const CSS_TEXT = 'body { color: #123456; }';
 const PNG_BYTES = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 1, 2, 3, 250, 255];
+// >4MB: over the /asset per-entry cache cap, so it must never be cached.
+const HUGE_ASSET_BYTES = Buffer.alloc(4 * 1024 * 1024 + 1024, 0x5a);
 
 // ---------------------------------------------------------------- helpers
 
@@ -90,6 +98,17 @@ async function getJson(url) {
     cache: response.headers.get('cache-control') || '',
     json: text === '' ? null : JSON.parse(text),
     text,
+  };
+}
+
+async function getBytes(url, headers) {
+  const response = await fetch(url, { redirect: 'follow', headers });
+  return {
+    status: response.status,
+    type: response.headers.get('content-type') || '',
+    cache: response.headers.get('cache-control') || '',
+    etag: response.headers.get('etag') || '',
+    body: Buffer.from(await response.arrayBuffer()),
   };
 }
 
@@ -181,6 +200,14 @@ function createTargetHandler() {
         res.writeHead(200, { 'content-type': 'text/plain', 'content-length': '4096' });
         res.end('x'.repeat(4096));
         return;
+      case '/asset-huge':
+        // Complete 200 response above the 4MB /asset cache entry cap.
+        res.writeHead(200, {
+          'content-type': 'application/octet-stream',
+          'content-length': String(HUGE_ASSET_BYTES.length),
+        });
+        res.end(HUGE_ASSET_BYTES);
+        return;
       case '/asset-slow': {
         // Never answers in time for a 100ms asset timeout.
         const timer = setTimeout(() => {
@@ -264,6 +291,10 @@ test('module exports the frozen host contract (inject + helpers)', () => {
   assert.equal(ASSET_PATH, '/asset', 'asset path constant');
   // v1.5 (SPEC §14.2)
   assert.equal(TARGET_URL_META_NAME, 'dsh-web-annotator-url', 'target-url meta name constant');
+  // v1.7 (performance)
+  assert.equal(VENDOR_CACHE_CONTROL, 'public, max-age=31536000, immutable', 'vendor cache-control');
+  assert.equal(RUNTIME_CACHE_CONTROL, 'no-cache', 'runtime cache-control');
+  assert.equal(ASSET_CACHE_CONTROL, 'private, max-age=60', 'asset cache-control');
 });
 
 test('normalizeTargetUrl accepts http(s) and rejects everything else', () => {
@@ -422,7 +453,7 @@ test('proxy server: health, runtime.js, html injection, passthrough and errors',
   assert.equal(runtime.status, 200);
   assert.match(runtime.type, /application\/javascript/);
   assert.ok(runtime.text.includes('dsh-web-annotator'), 'runtime body served');
-  assert.equal(runtime.cache, 'no-store', 'runtime.js is no-store');
+  assert.equal(runtime.cache, 'no-cache', 'runtime.js is revalidated (no-cache)');
 
   // --- html proxy: injection -------------------------------------------
   const page = await getText(
@@ -593,7 +624,7 @@ test('proxy server: v1.1 vendored html2canvas and /asset same-origin proxy', asy
   const vendor = await getText(base + VENDOR_PATH);
   assert.equal(vendor.status, 200, 'vendor build served');
   assert.match(vendor.type, /application\/javascript/, 'vendor is javascript');
-  assert.equal(vendor.cache, 'no-store', 'vendor is no-store');
+  assert.equal(vendor.cache, 'public, max-age=31536000, immutable', 'vendor is immutable-cacheable');
   assert.ok(vendor.text.length > 100000, 'vendor build is the full html2canvas (>100000 chars)');
   assert.ok(vendor.text.includes('html2canvas'), 'vendor body really is html2canvas');
 
@@ -613,7 +644,7 @@ test('proxy server: v1.1 vendored html2canvas and /asset same-origin proxy', asy
   assert.equal(css.status, 200, 'css fetched through /asset');
   assert.match(css.type, /text\/css/, 'css content-type passed through');
   assert.equal(css.text, CSS_TEXT, 'css body passed through');
-  assert.equal(css.cache, 'no-store', 'asset is no-store');
+  assert.equal(css.cache, 'private, max-age=60', 'asset response is private max-age=60');
 
   const cssBlob = await getText(
     base + ASSET_PATH + '?url=' + encodeTarget(targetOrigin + '/style.css') + '&responseType=blob',
@@ -642,7 +673,7 @@ test('proxy server: v1.1 vendored html2canvas and /asset same-origin proxy', asy
   );
   assert.equal(dupePng.status, 200, 'html2canvas-style ?url=&url= request works');
   assert.match(dupePng.headers.get('content-type') || '', /image\/png/);
-  assert.equal(dupePng.headers.get('cache-control') || '', 'no-store');
+  assert.equal(dupePng.headers.get('cache-control') || '', 'private, max-age=60');
   assert.deepEqual(
     [...Buffer.from(await dupePng.arrayBuffer())],
     PNG_BYTES,
@@ -829,6 +860,163 @@ test('proxy server: v1.5 final URL base/meta and https auto fallback', async (t)
 
   const stillHealthy = await getJson(base + HEALTH_PATH);
   assert.deepEqual(stillHealthy.json, { ok: true }, 'server survives v1.5 error paths');
+});
+
+// ---------------------------------------------------------------- v1.7 (performance)
+
+test('proxy server: v1.7 asset LRU cache, cache headers and runtime ETag/304', async (t) => {
+  const baseHandler = createTargetHandler();
+  const upstreamHits = new Map();
+  const target = http.createServer((req, res) => {
+    let pathname = '/';
+    try {
+      pathname = new URL(req.url || '/', 'http://127.0.0.1').pathname;
+    } catch {
+      /* keep default */
+    }
+    upstreamHits.set(pathname, (upstreamHits.get(pathname) || 0) + 1);
+    baseHandler(req, res);
+  });
+  const targetPort = await listenServer(target);
+  const targetOrigin = 'http://127.0.0.1:' + targetPort;
+
+  // File-backed runtime.js: exercises the real mtime+size read cache and ETag.
+  const proxy = createAnnotatorServer();
+  const proxyPort = await listenServer(proxy);
+  const base = 'http://127.0.0.1:' + proxyPort;
+
+  // Separate server whose runtime.js points at a temp file we can rewrite.
+  const runtimeFile = join(
+    tmpdir(),
+    `dsh-web-annotator-runtime-${process.pid}-${Date.now()}.js`,
+  );
+  writeFileSync(runtimeFile, '/* runtime v1 dsh-web-annotator */\n');
+  const fileProxy = createAnnotatorServer({ runtimeFilePath: runtimeFile });
+  const fileProxyPort = await listenServer(fileProxy);
+  const fileBase = 'http://127.0.0.1:' + fileProxyPort;
+
+  t.after(async () => {
+    await closeServer(proxy);
+    await closeServer(fileProxy);
+    await closeServer(target);
+    try {
+      unlinkSync(runtimeFile);
+    } catch {
+      /* already gone */
+    }
+  });
+
+  // --- /asset LRU: a second request must not touch the upstream ----------
+  const pixelProxyUrl = base + ASSET_PATH + '?url=' + encodeTarget(targetOrigin + '/pixel.png');
+  const assetStarted = performance.now();
+  const first = await getBytes(pixelProxyUrl);
+  const assetFirstMs = performance.now() - assetStarted;
+  assert.equal(first.status, 200);
+  assert.deepEqual([...first.body], PNG_BYTES, 'first asset body is correct');
+  assert.equal(first.cache, 'private, max-age=60', 'asset response is private max-age=60');
+  assert.equal(upstreamHits.get('/pixel.png'), 1, 'first asset request reaches upstream');
+
+  const secondStarted = performance.now();
+  const second = await getBytes(pixelProxyUrl);
+  const assetSecondMs = performance.now() - secondStarted;
+  assert.equal(second.status, 200);
+  assert.deepEqual([...second.body], PNG_BYTES, 'cached asset body is correct');
+  assert.equal(second.cache, 'private, max-age=60', 'cached response keeps the cache header');
+  assert.equal(
+    upstreamHits.get('/pixel.png'),
+    1,
+    'second asset request is served from the LRU cache (upstream hit only once)',
+  );
+
+  // --- >4MB responses are never cached ---------------------------------
+  const hugeProxyUrl = base + ASSET_PATH + '?url=' + encodeTarget(targetOrigin + '/asset-huge');
+  const hugeFirst = await getBytes(hugeProxyUrl);
+  assert.equal(hugeFirst.status, 200);
+  assert.equal(hugeFirst.body.length, HUGE_ASSET_BYTES.length, 'huge asset body size');
+  assert.equal(upstreamHits.get('/asset-huge'), 1);
+  const hugeSecond = await getBytes(hugeProxyUrl);
+  assert.equal(hugeSecond.status, 200);
+  assert.equal(hugeSecond.body.length, HUGE_ASSET_BYTES.length);
+  assert.equal(
+    upstreamHits.get('/asset-huge'),
+    2,
+    '>4MB asset is not cached: upstream is contacted again',
+  );
+
+  // --- cache headers on the other routes --------------------------------
+  const vendor = await getBytes(base + VENDOR_PATH);
+  assert.equal(vendor.cache, 'public, max-age=31536000, immutable', 'vendor is immutable-cacheable');
+  const health = await getJson(base + HEALTH_PATH);
+  assert.equal(health.cache, 'no-store', '/health stays no-store');
+  const page = await getText(base + PROXY_PATH + '?url=' + encodeTarget(targetOrigin + '/ok'));
+  assert.equal(page.cache, 'no-store', '/proxy stays no-store');
+
+  // --- runtime.js: no-cache + strong ETag + 304 -------------------------
+  const runtimeFirst = await getBytes(base + RUNTIME_PATH);
+  assert.equal(runtimeFirst.status, 200);
+  assert.ok(runtimeFirst.body.length > 1000, 'runtime.js body served');
+  assert.equal(runtimeFirst.cache, 'no-cache', '/runtime.js must be revalidated (no-cache)');
+  assert.match(
+    runtimeFirst.etag,
+    /^"[0-9a-f]+-[0-9a-f]+"$/,
+    'ETag is a strong mtime+size token in quotes',
+  );
+
+  const notModified = await fetch(base + RUNTIME_PATH, {
+    headers: { 'if-none-match': runtimeFirst.etag },
+  });
+  assert.equal(notModified.status, 304, 'If-None-Match matching the ETag -> 304');
+  assert.equal(await notModified.text(), '', '304 response has an empty body');
+  assert.equal(notModified.headers.get('etag'), runtimeFirst.etag, '304 repeats the ETag');
+  assert.equal(notModified.headers.get('cache-control'), 'no-cache');
+
+  const staleEtag = await getBytes(base + RUNTIME_PATH, { 'if-none-match': '"stale-etag"' });
+  assert.equal(staleEtag.status, 200, 'non-matching If-None-Match -> 200');
+
+  // --- runtime.js file changes invalidate the read cache ----------------
+  const fileRuntime1 = await getBytes(fileBase + RUNTIME_PATH);
+  assert.equal(fileRuntime1.status, 200);
+  assert.match(fileRuntime1.body.toString('utf8'), /runtime v1/, 'temp runtime v1 served');
+  const etagV1 = fileRuntime1.etag;
+  assert.ok(etagV1.length > 0, 'temp runtime has an ETag');
+  // Rewrite with different content (and size): mtime+size must invalidate.
+  writeFileSync(runtimeFile, '/* runtime v2 changed dsh-web-annotator */\n');
+  const fileRuntime2 = await getBytes(fileBase + RUNTIME_PATH);
+  assert.equal(fileRuntime2.status, 200);
+  assert.match(fileRuntime2.body.toString('utf8'), /runtime v2 changed/, 'changed runtime.js served');
+  assert.notEqual(fileRuntime2.etag, etagV1, 'ETag changes when runtime.js changes');
+
+  // --- measurement line for the report ----------------------------------
+  const proxy50Url = base + PROXY_PATH + '?url=' + encodeTarget(targetOrigin + '/ok');
+  await fetch(proxy50Url).then((response) => response.text());
+  const proxyStarted = performance.now();
+  for (let index = 0; index < 50; index += 1) {
+    const response = await fetch(proxy50Url);
+    await response.text();
+  }
+  const proxyAverageMs = (performance.now() - proxyStarted) / 50;
+  const runtimeSteadyStarted = performance.now();
+  for (let index = 0; index < 20; index += 1) {
+    const response = await fetch(base + RUNTIME_PATH);
+    await response.text();
+  }
+  const runtimeAverageMs = (performance.now() - runtimeSteadyStarted) / 20;
+  console.log(
+    '[host.test v1.7] asset first=' +
+      assetFirstMs.toFixed(2) +
+      'ms second=' +
+      assetSecondMs.toFixed(2) +
+      'ms (upstream hits: first=' +
+      upstreamHits.get('/pixel.png') +
+      ' total-for-huge=' +
+      upstreamHits.get('/asset-huge') +
+      '); proxy50 avg=' +
+      proxyAverageMs.toFixed(2) +
+      'ms; runtime avg=' +
+      runtimeAverageMs.toFixed(2) +
+      'ms; runtime bytes=' +
+      runtimeFirst.body.length,
+  );
 });
 
 test('proxy server: start() binds loopback and close() stops it idempotently', async () => {

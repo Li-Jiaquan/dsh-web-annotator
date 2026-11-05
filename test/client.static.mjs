@@ -263,6 +263,55 @@ check('client.js implements v1.6 back/forward/reload history', () => {
   return 'browser history ok';
 });
 
+// ------------------------------------------------- v1.7 render/message perf
+check('client.js keeps the iframe stable and memoizes render/message work', () => {
+  // 1) The iframe source is a stable memo of navigation state only.
+  assertIncludes(source, 'const useMemo = React.useMemo', 'useMemo is available');
+  assertIncludes(source, 'const frameSrc = useMemo(', 'iframe src comes from useMemo');
+  assertIncludes(
+    source,
+    '[endpoint.phase, endpoint.origin, targetUrl, targetAuto, reloadToken]',
+    'iframe src memo depends only on navigation state',
+  );
+  const srcStart = source.indexOf('const frameSrc = useMemo(');
+  assert(srcStart >= 0, 'frameSrc memo missing');
+  const srcBlock = source.slice(srcStart, source.indexOf('const frameLoaded', srcStart));
+  for (const volatile of ['urlInput', 'pageLoading', 'sending', 'annotations', 'notice', 'statusText', 'history']) {
+    assert(!srcBlock.includes(volatile), 'iframe src must not depend on volatile render state: ' + volatile);
+  }
+  assert(srcBlock.includes('reloadToken > 0'), 'reload token is the only deliberate remount input');
+  // The iframe key only changes on an explicit load (frameNonce), not on state.
+  assertIncludes(source, "key: 'frame-' + frameNonce", 'stable iframe key');
+  // Stable callbacks keep the iframe props identical across ordinary renders.
+  assertIncludes(source, 'const handleFrameLoad = useCallback(', 'stable iframe load handler');
+  assertIncludes(source, 'const handleFrameError = useCallback(', 'stable iframe error handler');
+  // 2) Message listener bails out cheaply before doing any work.
+  assertIncludes(source, 'const INBOUND_TYPES = new Set(PAGE_TO_PARENT)', 'O(1) inbound vocabulary');
+  assertIncludes(source, "const NOOP_INBOUND_TYPES = new Set(['marker-hover', 'marker-click'])", 'page-only noise skipped');
+  assert(!source.includes('PAGE_TO_PARENT.indexOf(data.type)'), 'no linear vocabulary scan per message');
+  const channelGuard = source.indexOf('data.channel !== CHANNEL) return;', source.indexOf('const handleMessage'));
+  const typeGuard = source.indexOf('!INBOUND_TYPES.has(data.type)) return;', channelGuard);
+  const noopGuard = source.indexOf('NOOP_INBOUND_TYPES.has(data.type)) return;', typeGuard);
+  const originGuard = source.indexOf('event.origin', noopGuard);
+  assert(channelGuard >= 0, 'channel guard missing');
+  assert(typeGuard > channelGuard, 'type guard follows the channel guard');
+  assert(noopGuard > typeGuard, 'no-op types bail out before origin/state work');
+  assert(originGuard > noopGuard, 'origin validation stays after the cheap guards');
+  // Large screenshot responses are matched before any decoding work.
+  assertIncludes(source, 'if (!pending || pending.requestId !== requestId) return;', 'screenshot fast path before decode');
+  // 3) Expensive derived values are memoized / computed once per render.
+  assertIncludes(source, 'const markerSignature = useMemo(', 'marker signature memoized');
+  assertIncludes(source, "const sendLabel = t('toolbar.send', { count: annotations.length })", 'send label computed once');
+  assert((source.match(/t\('toolbar\.send'/g) || []).length === 1, 'toolbar.send is localized once per render');
+  // 4) Large base64 payloads avoid an unconditional full-string rewrite.
+  const decodeStart = source.indexOf('function decodePngDataUrl(dataUrl)');
+  assert(decodeStart >= 0, 'decodePngDataUrl missing');
+  const decodeBlock = source.slice(decodeStart, decodeStart + 1200);
+  assert(decodeBlock.includes('binary = atob(payload);'), 'fast atob path first');
+  assert(decodeBlock.includes("atob(payload.replace(/\\s+/g, ''))"), 'whitespace fallback only after failure');
+  return 'render/message perf ok';
+});
+
 check('client.js resolves proxyOrigin through the host endpoint with 503 retries', () => {
   assertIncludes(source, "'/dsh-web-annotator/endpoint'", 'endpoint path');
   assertIncludes(source, "credentials: 'same-origin'", 'same-origin credentials');
@@ -293,7 +342,8 @@ check('client.js writes the prompt into the composer draft (never submits)', () 
   // v1.5 re-enables the page-loading line while a navigation is in flight.
   assertIncludes(source, "t('status.iframeLoading')", 'shows the page-loading status during navigation');
   assertIncludes(source, 'pageLoading', 'navigation loading state');
-  assertIncludes(source, "t('toolbar.send', { count: annotations.length })", 'toolbar button carries the count');
+  assertIncludes(source, "const sendLabel = t('toolbar.send', { count: annotations.length })", 'toolbar label built once');
+  assert((source.match(/t\('toolbar\.send'/g) || []).length === 1, 'toolbar.send is localized once per render');
   assertIncludes(
     source,
     "buildPrompt(list, '', hasScreenshot ? t('prompt.screenshotFullPage') : '')",
@@ -322,7 +372,8 @@ check('client.js implements v1.2 in-page comments: mirror, no list panel, two se
   assertIncludes(source, "case 'request-submit'", 'submit handler');
   assertIncludes(source, 'submitHandlerRef', 'latest submit handler reachable from the listener');
   // Toolbar send button with the annotation count (SPEC §11.1.3).
-  assertIncludes(source, "t('toolbar.send', { count: annotations.length })", 'send button label carries the count');
+  assertIncludes(source, 'sendLabel', 'send button label carries the count (memoized per render)');
+  assertIncludes(source, 'title: sendLabel', 'send button title reuses the computed label');
   assertIncludes(source, 'toolbar.send', 'toolbar.send locale key');
   assertIncludes(source, "data-dsha-send", 'send button marker for the UI/tests');
   assertIncludes(source, "sendToFrame('clear')", 'successful send resets the page state');
@@ -823,6 +874,9 @@ check('factory + apply smoke test with a stub React and Cordis context', () => {
     },
     useCallback(fn) {
       return fn;
+    },
+    useMemo(fn) {
+      return fn();
     },
     useEffect() {},
     useRef(value) {
