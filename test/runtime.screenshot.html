@@ -386,6 +386,11 @@
             return;
           }
 
+          if (window.location.search.indexOf('mirrorbase') >= 0) {
+            await runMirrorBase(root);
+            return;
+          }
+
           var green = pageRect(document.getElementById('green-box'));
           var image = pageRect(document.getElementById('cross-img'));
           var crossCss = pageRect(document.getElementById('cross-css-box'));
@@ -778,6 +783,119 @@
           pass();
         }
 
+        /* v1.8 SPEC §16.3: the mirror <base> must not leak into navigate URLs. */
+        async function runMirrorBase(root) {
+          assert('overlay-root', !!root, 'missing runtime overlay');
+          var readyEntries = [];
+          for (var readyIndex = 0; readyIndex < messages.length; readyIndex += 1) {
+            if (messages[readyIndex].type === 'ready') readyEntries.push(messages[readyIndex]);
+          }
+          var readyUrl = readyEntries.length ? String(readyEntries[0].payload.url || '') : '';
+          set('mirror-ready-url', readyUrl);
+          assert('mirror-ready-url-meta', readyUrl === 'https://example.test/base/', readyUrl);
+
+          function countNavigate() {
+            var total = 0;
+            for (var navIndex = 0; navIndex < messages.length; navIndex += 1) {
+              if (messages[navIndex].type === 'navigate') total += 1;
+            }
+            return total;
+          }
+
+          function clickAnchor(id) {
+            var element = document.getElementById(id);
+            var event = new MouseEvent('click', { bubbles: true, composed: true, cancelable: true });
+            element.dispatchEvent(event);
+            return event;
+          }
+
+          async function clickAndWait(id, predicate) {
+            var start = messages.length;
+            var event = clickAnchor(id);
+            var navigateMessage = await waitForNewMessage('navigate', predicate, start, 2000);
+            return { event: event, message: navigateMessage };
+          }
+
+          // The fixture installs a mirror <base>, so anchor.href is a /site/ URL.
+          var rel2Anchor = document.getElementById('rel2-link');
+          var rel2Href = rel2Anchor ? String(rel2Anchor.href) : '';
+          set('mirror-anchor-href', rel2Href);
+          assert('mirror-base-installed', rel2Href.indexOf('/site/') >= 0, rel2Href);
+
+          // href="next" -> target base + next (NOT the mirror URL).
+          var rel2 = await clickAndWait('rel2-link', function (data) {
+            return data.source === 'link';
+          });
+          assert(
+            'mirror-relative',
+            !!rel2.message && rel2.message.url === 'https://example.test/base/next',
+            rel2.message ? rel2.message.url : 'none'
+          );
+          assert('mirror-relative-default-prevented', rel2.event.defaultPrevented === true, String(rel2.event.defaultPrevented));
+          set('mirror-relative-url', rel2.message ? rel2.message.url : 'none');
+
+          // href="/x" -> target origin root.
+          var rootRelative = await clickAndWait('abs-link', function (data) {
+            return data.url === 'https://example.test/x';
+          });
+          assert('mirror-root-relative', !!rootRelative.message, rootRelative.message ? rootRelative.message.url : 'none');
+          set('mirror-root-url', rootRelative.message ? rootRelative.message.url : 'none');
+
+          // Absolute https link unchanged.
+          var absolute = await clickAndWait('ext-link', function (data) {
+            return data.url === 'https://example.com/x';
+          });
+          assert('mirror-absolute', !!absolute.message, absolute.message ? absolute.message.url : 'none');
+
+          // javascript: links are still ignored. (A pure #hash link is asserted in
+          // the main fixture: with a mirror <base> the browser resolves "#x" to the
+          // base URL and performs a real navigation, which is default browser
+          // behaviour, not a runtime navigate.)
+          var navCountBefore = countNavigate();
+          var jsEvent = clickAnchor('js-link');
+          await wait(80);
+          assert(
+            'mirror-javascript-ignored',
+            countNavigate() === navCountBefore && jsEvent.defaultPrevented === false,
+            'javascript: link was intercepted'
+          );
+
+          // window.open(raw) resolves against the target URL too.
+          var openStart = messages.length;
+          var opened = window.open('page2');
+          var openMessage = await waitForNewMessage(
+            'navigate',
+            function (data) {
+              return data.source === 'window-open';
+            },
+            openStart,
+            2000
+          );
+          assert(
+            'mirror-window-open',
+            !!openMessage && openMessage.url === 'https://example.test/base/page2',
+            openMessage ? openMessage.url : 'none'
+          );
+          assert('mirror-window-open-null', opened === null, String(opened));
+          set('mirror-window-open-url', openMessage ? openMessage.url : 'none');
+
+          var openExtStart = messages.length;
+          window.open('https://example.com/opened');
+          var openExtMessage = await waitForNewMessage(
+            'navigate',
+            function (data) {
+              return data.url === 'https://example.com/opened';
+            },
+            openExtStart,
+            2000
+          );
+          assert('mirror-window-open-absolute', !!openExtMessage, openExtMessage ? openExtMessage.url : 'none');
+
+          assert('no-errors', errors.length === 0, errors.join(' | '));
+          set('done', '1');
+          pass();
+        }
+
         async function runReadyUrl(root, kind) {
           assert('overlay-root', !!root, 'missing runtime overlay');
           var readyEntries = [];
@@ -890,6 +1008,8 @@
   <body>
     <div class="row" id="links-row">
       <a id="rel-link" href="/next">相对链接</a>
+      <a id="rel2-link" href="next">相对无斜杠</a>
+      <a id="abs-link" href="/x">根相对</a>
       <a id="ext-link" href="https://example.com/x">外部链接</a>
       <a id="hash-link" href="#section">页内锚点</a>
       <a id="js-link" href="javascript:void(0)">脚本链接</a>

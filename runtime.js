@@ -661,7 +661,15 @@
     });
   }
 
-  /** Resolve an href / window.open target to an absolute http(s) URL, else null. */
+  /**
+   * Resolve a raw href / window.open argument to an absolute http(s) URL, else null.
+   *
+   * v1.8 SPEC §16.3: /proxy now injects a same-origin mirror <base>
+   * (/site/<scheme>/<hostport>/), so `anchor.href` resolves to a mirror URL.
+   * Resolve the RAW attribute value against the *target* URL instead (meta,
+   * then the proxy's ?url=, then location.href) so `navigate` always carries
+   * the real target URL.
+   */
   function resolveNavigableUrl(raw) {
     if (raw == null) return null;
     var text = String(raw).replace(/^\s+|\s+$/g, '');
@@ -669,8 +677,21 @@
     // Pure in-page hash links and javascript: URLs are not navigations.
     if (text.charAt(0) === '#') return null;
     if (/^javascript:/i.test(text)) return null;
+    var baseUrl = '';
     try {
-      var resolved = new URL(text, document.baseURI || window.location.href);
+      baseUrl = targetUrlFromDocument();
+    } catch (error) {
+      baseUrl = '';
+    }
+    if (!baseUrl) {
+      try {
+        baseUrl = String(window.location.href);
+      } catch (error) {
+        baseUrl = '';
+      }
+    }
+    try {
+      var resolved = new URL(text, baseUrl || undefined);
       if (resolved.protocol !== 'http:' && resolved.protocol !== 'https:') return null;
       return resolved.href;
     } catch (error) {

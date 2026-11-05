@@ -109,7 +109,8 @@ v1.7 做了一轮性能优化，全部可复现（`node test/bench.capture.mjs`�
 ## 安全与限制（v1.1）
 
 - 页面经宿主插件在 **独立 origin（127.0.0.1 随机端口）** 代理后放入 iframe，与 Harness GUI 隔离；只允许 http/https，15s 超时、HTML 5MB 上限。
-- 目标页相对资源通过注入的 `<base href="{目标URL}">` 回源加载；**依赖目标站 CORS 的 `type=module` 脚本可能加载失败**，重登录态页面不可用（与 Codex 应用内浏览器同样只适合本地开发页/公开未登录页）。
+- v1.8 起相对资源通过**同源镜像** `/site/<scheme>/<host>/...` 加载（不再让模块脚本跨源去目标站取），因此用 ES module / 相对路径资源的页面（Vite 构建页、静态站点等）在批注窗口里可以正常执行 JS；但**目标页 JS 里写死的绝对路径请求**（`fetch('/api')`、`import '/x.js'`）、**POST 表单**、嵌套文档里的 `<base>` 仍不会经过镜像，可能 404/405 或脱离代理。
+- 重登录态页面不可用（与 Codex 应用内浏览器同样只适合本地开发页/公开未登录页）。
 - 代理会重写顶层 HTML 并注入 `<base>`/运行时脚本；hash 路由（`#/x`）在代理后会丢失，SPA 的绝对路径 XHR 可能 404。遇到白屏可直接在地址栏换成页面直连地址查看。
 - 截图是**页面渲染结果的近似**（html2canvas 不是浏览器原生截屏）：复杂滤镜、部分 WebGL/canvas、跨源字体与 iframe 内部内容可能缺失或样式略有偏差；要定位问题足够，不要把它当像素级设计稿。
 - 目标页 CSP 若禁止注入脚本，批注运行时不会执行（此时页面正常显示但不可批注）；CSP 也挡不住同源 `/vendor` 脚本（宿主已剥掉目标 CSP/XFO，见测试）。
@@ -119,19 +120,19 @@ v1.7 做了一轮性能优化，全部可复现（`node test/bench.capture.mjs`�
 
 ```
 node --check index.js client.js runtime.js
-node test/host.test.mjs          # 12/12 宿主代理、endpoint、/vendor、/asset（含缓存/ETag）、协议回退、最终 URL/base/meta
+node test/host.test.mjs          # 13/13 宿主代理、/site 同源镜像、endpoint、/vendor、/asset（含缓存/ETag）、协议回退
 node test/client.static.mjs      # 23/23 客户端外壳/槽注册/协议/模板/草稿写入/整页截图/地址栏/导航/浏览器历史/渲染性能
 node test/runtime-check.mjs      # 73/73 运行时契约 + headless Chrome 端到端手势
-node test/runtime.screenshot.mjs # 100/100 整页标注截图 + 链接 navigate/ready-url + 渲染分辨率自适应
+node test/runtime.screenshot.mjs # 112/112 整页标注截图 + 链接 navigate/ready-url + 镜像 base 目标 URL 推导
 node test/runtime.comments.mjs   # 93/93 空格穿透 + 悬浮评论窗/写入对话框浮动条/清空同步
-node test/accept.mjs             # 22/22 Lead 验收：清单/图标/语法/协议一致性/宿主集成/路由/契约
+node test/accept.mjs             # 23/23 Lead 验收：清单/图标/语法/协议一致性/宿主集成/路由/契约/镜像
 
 # 性能基准（无需网络）
 node test/bench.capture.mjs      # 长页截图捕获：capture/render 耗时、渲染像素、canvas 内存
 node test/bench.host.mjs         # 宿主：/asset 缓存命中、/runtime.js 读取、/proxy 吞吐
 ```
 
-接口契约见 `SPEC.md`（冻结）：§0-§9 为 v1.0 基础协议，§10 为 v1.1 截图附件，§11 为 v1.2 页面内悬浮评论窗交互，§12 为 v1.3 空格穿透 + 整页标注截图，§13 为 v1.4 状态栏精简 + 写入对话框，§14 为 v1.5 地址栏自动协议 + 链接跳转，§15 为 v1.6 浏览器式 后退/前进/刷新。
+接口契约见 `SPEC.md`（冻结）：§0-§9 为 v1.0 基础协议，§10 为 v1.1 截图附件，§11 为 v1.2 页面内悬浮评论窗交互，§12 为 v1.3 空格穿透 + 整页标注截图，§13 为 v1.4 状态栏精简 + 写入对话框，§14 为 v1.5 地址栏自动协议 + 链接跳转，§15 为 v1.6 浏览器式 后退/前进/刷新，§16 为 v1.8 同源镜像代理（ES module 页面兼容）。
 
 ## License
 

@@ -212,7 +212,7 @@ await check('host proxy integration: health, runtime, html injection, 400/502', 
     assert(runtime.status === 200 && runtime.text.includes('dsh-web-annotator-root'), 'runtime.js served');
     const injected = await getText(base + '/proxy?url=' + encodeURIComponent('http://127.0.0.1:' + targetPort + '/ok'));
     assert(injected.status === 200, 'proxy 200');
-    assert(injected.text.includes('<base href="http://127.0.0.1:' + targetPort + '/ok"'), 'proxy base href');
+    assert(injected.text.includes('<base href="/site/http/127.0.0.1:' + targetPort + '/"'), 'proxy base href (v1.8 mirror)');
     assert(injected.text.includes('/runtime.js'), 'proxy runtime script');
     assert(injected.text.includes('Save'), 'proxy keeps markup');
     const plain = await getText(base + '/proxy?url=' + encodeURIComponent('http://127.0.0.1:' + targetPort + '/plain'));
@@ -437,6 +437,18 @@ await check('v1.6: browser-style back / forward / reload in the toolbar', () => 
   const zh = JSON.parse(read('locale/zh.json'));
   for (const key of ['toolbar.back', 'toolbar.forward', 'toolbar.reload']) {
     assert(typeof zh[key] === 'string' && zh[key].length > 0, 'zh locale key ' + key);
+  }
+  return 'ok';
+});
+
+await check('v1.8: same-origin mirror keeps ES module pages working', () => {
+  const host = read('index.js');
+  for (const needle of ['/site/', 'SITE_PATH', 'mirrorPrefix']) {
+    assert(host.includes(needle), 'index.js must mention ' + needle);
+  }
+  const runtime = read('runtime.js');
+  for (const needle of ['targetUrlFromDocument', 'resolveNavigableUrl']) {
+    assert(runtime.includes(needle), 'runtime.js must mention ' + needle);
   }
   return 'ok';
 });

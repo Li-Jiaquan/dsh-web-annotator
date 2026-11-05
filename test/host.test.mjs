@@ -25,6 +25,7 @@ import {
   PROXY_PATH,
   RUNTIME_CACHE_CONTROL,
   RUNTIME_PATH,
+  SITE_PATH,
   TARGET_URL_META_NAME,
   VENDOR_CACHE_CONTROL,
   VENDOR_PATH,
@@ -149,6 +150,67 @@ function createTargetHandler() {
       case '/plain':
         res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
         res.end('hello');
+        return;
+      case '/echo': {
+        // Query forwarding check for GET /site/...?... (raw search is echoed).
+        const search = new URL(req.url || '/', 'http://127.0.0.1').search;
+        res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+        res.end('query=' + search);
+        return;
+      }
+      case '/app.js':
+        res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8' });
+        res.end('export const mirrored = true;\n');
+        return;
+      case '/site.css':
+        res.writeHead(200, { 'content-type': 'text/css; charset=utf-8' });
+        res.end(
+          '@import "/base.css";\n' +
+            "@import url('/other.css');\n" +
+            'body { background: url(/img/bg.png); }\n' +
+            '.icon { background: url("/img/icon.png"); }\n' +
+            '.ext { background: url(https://cdn.example/x.png); }\n' +
+            '.data { background: url(data:image/png;base64,AAAA); }\n' +
+            '.proto { background: url(//cdn.example/y.png); }\n',
+        );
+        return;
+      case '/nested.html':
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+        res.end(
+          '<!doctype html><html><head><link rel="stylesheet" href="/site.css"></head><body>' +
+            '<img id="nested-img" src="/pixel.png" srcset="/pixel.png 1x, /big.png 2x">' +
+            '<a href="/next">next</a>' +
+            '<a href="https://example.com/x">ext</a>' +
+            '<a href="//cdn.example/z">proto</a>' +
+            '</body></html>',
+        );
+        return;
+      case '/abs':
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+        res.end(
+          '<!doctype html><html><head>' +
+            '<base href="/sub/" target="_blank">' +
+            '<link rel="stylesheet" href="/style.css">' +
+            '<script type="module" src="/app.js"></script>' +
+            '<link rel="preconnect" href="//cdn.example/">' +
+            '</head><body>' +
+            '<a id="abs" href="/next">next</a>' +
+            '<a id="rel" href="relative.html">rel</a>' +
+            '<a id="ext" href="https://cdn.example/x">ext</a>' +
+            '<img id="img" src="/pixel.png" srcset="/pixel.png 1x, /pixel@2x.png 2x">' +
+            '<form action="/submit"></form>' +
+            '<video poster="/poster.png"></video>' +
+            '</body></html>',
+        );
+        return;
+      case '/site-big':
+        // Declared/actual size exceeds the small binaryLimitBytes of the test proxy.
+        res.writeHead(200, { 'content-type': 'text/plain' });
+        res.end('y'.repeat(4096));
+        return;
+      case '/':
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+        res.end('<html><head><title>root</title></head><body><p>root page</p></body></html>');
         return;
       case '/binary':
         res.writeHead(200, { 'content-type': 'application/octet-stream' });
@@ -295,6 +357,8 @@ test('module exports the frozen host contract (inject + helpers)', () => {
   assert.equal(VENDOR_CACHE_CONTROL, 'public, max-age=31536000, immutable', 'vendor cache-control');
   assert.equal(RUNTIME_CACHE_CONTROL, 'no-cache', 'runtime cache-control');
   assert.equal(ASSET_CACHE_CONTROL, 'private, max-age=60', 'asset cache-control');
+  // v1.8 (same-origin mirror)
+  assert.equal(SITE_PATH, '/site/', 'site mirror path constant');
 });
 
 test('normalizeTargetUrl accepts http(s) and rejects everything else', () => {
@@ -429,6 +493,8 @@ test('proxy server: health, runtime.js, html injection, passthrough and errors',
   const target = http.createServer(createTargetHandler());
   const targetPort = await listenServer(target);
   const targetOrigin = 'http://127.0.0.1:' + targetPort;
+  // v1.8: /proxy points <base> at the same-origin mirror, not at the target.
+  const targetMirror = '/site/http/127.0.0.1:' + targetPort + '/';
 
   // Bind through the raw node:http API (the same way the acceptance harness
   // binds it) to prove createAnnotatorServer returns a real http.Server.
@@ -464,7 +530,11 @@ test('proxy server: health, runtime.js, html injection, passthrough and errors',
   assert.equal(page.cache, 'no-store', 'proxied page is no-store');
   assert.equal(page.frame, '', 'no X-Frame-Options is added');
   assert.equal(page.csp, '', 'no target CSP is copied (would block /vendor and /asset)');
-  assert.ok(page.text.includes('<base href="' + targetOrigin + '/ok">'), 'base href = target url');
+  assert.ok(page.text.includes('<base href="' + targetMirror + '">'), 'base href = /site/ mirror');
+  assert.ok(
+    page.text.includes('<meta name="dsh-web-annotator-url" content="' + targetOrigin + '/ok">'),
+    'meta still carries the real target URL',
+  );
   assert.ok(page.text.includes('data-dsh-web-annotator'), 'injection marker present');
   assert.ok(
     page.text.includes('<script defer src="' + base + RUNTIME_PATH + '"></script>'),
@@ -477,7 +547,7 @@ test('proxy server: health, runtime.js, html injection, passthrough and errors',
   // --- html proxy: no head / no content-type sniffing -------------------
   const bare = await getText(base + PROXY_PATH + '?url=' + encodeTarget(targetOrigin + '/bare'));
   assert.equal(bare.status, 200);
-  assert.ok(bare.text.includes('<base href="' + targetOrigin + '/bare">'), 'bare page gets base');
+  assert.ok(bare.text.includes('<base href="' + targetMirror + '">'), 'bare page gets the mirror base');
   assert.ok(bare.text.includes('<head></head>'), 'synthetic head for bare page');
   assert.ok(bare.text.endsWith('</script>'), 'bare page gets runtime script appended');
 
@@ -491,7 +561,11 @@ test('proxy server: health, runtime.js, html injection, passthrough and errors',
     base + PROXY_PATH + '?url=' + encodeTarget(targetOrigin + '/redirect'),
   );
   assert.equal(redirected.status, 200);
-  assert.ok(redirected.text.includes('<base href="' + targetOrigin + '/ok">'), 'base uses final url');
+  assert.ok(redirected.text.includes('<base href="' + targetMirror + '">'), 'base uses final url mirror');
+  assert.ok(
+    redirected.text.includes('<meta name="dsh-web-annotator-url" content="' + targetOrigin + '/ok">'),
+    'redirected meta carries the final URL',
+  );
 
   // --- non-html passthrough --------------------------------------------
   const plain = await getText(
@@ -764,6 +838,8 @@ test('proxy server: v1.5 final URL base/meta and https auto fallback', async (t)
   const targetB = http.createServer(createTargetHandler());
   const targetBPort = await listenServer(targetB);
   const targetBOrigin = 'http://127.0.0.1:' + targetBPort;
+  const mirrorA = '/site/http/127.0.0.1:' + targetAPort + '/';
+  const mirrorB = '/site/http/127.0.0.1:' + targetBPort + '/';
 
   const proxy = createAnnotatorServer({ runtimeSource: RUNTIME_STUB });
   const proxyPort = await listenServer(proxy);
@@ -775,13 +851,13 @@ test('proxy server: v1.5 final URL base/meta and https auto fallback', async (t)
     await closeServer(targetB);
   });
 
-  // --- 302 across servers: base + meta use the final response URL --------
+  // --- 302 across servers: mirror base + real final URL meta -------------
   const shortUrl = targetAOrigin + '/redirect-to?to=' + encodeTarget(targetBOrigin + '/ok');
   const redirected = await getText(base + PROXY_PATH + '?url=' + encodeTarget(shortUrl));
   assert.equal(redirected.status, 200, 'redirected page proxied');
   assert.ok(
-    redirected.text.includes('<base href="' + targetBOrigin + '/ok">'),
-    'base href = final URL on server B',
+    redirected.text.includes('<base href="' + mirrorB + '">'),
+    'base href = mirror of final URL on server B',
   );
   assert.ok(
     redirected.text.includes(
@@ -793,16 +869,21 @@ test('proxy server: v1.5 final URL base/meta and https auto fallback', async (t)
     !redirected.text.includes('href="' + targetAOrigin + '/redirect-to'),
     'base href is not the pre-redirect request URL',
   );
+  assert.ok(
+    !redirected.text.includes('<base href="' + mirrorA + '">'),
+    'base href is not the pre-redirect mirror',
+  );
   assert.ok(redirected.text.includes('<button id="save">Save</button>'), 'final body proxied');
 
-  // Query strings: base href keeps `&` raw, the meta content is HTML-escaped.
+  // Query strings: the mirror base is query-free and the meta keeps the
+  // real final URL (HTML-escaped) including `&`.
   const withQuery =
     targetAOrigin + '/redirect-to?to=' + encodeTarget(targetBOrigin + '/ok?a=1&b=2');
   const redirectedQuery = await getText(base + PROXY_PATH + '?url=' + encodeTarget(withQuery));
   assert.equal(redirectedQuery.status, 200);
   assert.ok(
-    redirectedQuery.text.includes('<base href="' + targetBOrigin + '/ok?a=1&b=2">'),
-    'base keeps raw ampersand',
+    redirectedQuery.text.includes('<base href="' + mirrorB + '">'),
+    'mirror base carries no target query',
   );
   assert.ok(
     redirectedQuery.text.includes(
@@ -818,8 +899,8 @@ test('proxy server: v1.5 final URL base/meta and https auto fallback', async (t)
   );
   assert.equal(auto.status, 200, 'auto=1 https network failure -> http fallback 200');
   assert.ok(
-    auto.text.includes('<base href="http://127.0.0.1:' + targetBPort + '/ok">'),
-    'base href = http fallback URL',
+    auto.text.includes('<base href="' + mirrorB + '">'),
+    'base href = mirror of the http fallback URL',
   );
   assert.ok(
     auto.text.includes(
@@ -840,7 +921,7 @@ test('proxy server: v1.5 final URL base/meta and https auto fallback', async (t)
     base + PROXY_PATH + '?url=' + encodeTarget(targetBOrigin + '/ok') + '&auto=1',
   );
   assert.equal(autoHttp.status, 200, 'auto=1 with an http url still works');
-  assert.ok(autoHttp.text.includes('<base href="' + targetBOrigin + '/ok">'));
+  assert.ok(autoHttp.text.includes('<base href="' + mirrorB + '">'));
 
   // HTTP error responses are not network failures: no retry, same 502 shape.
   const boom = await getJson(
@@ -860,6 +941,194 @@ test('proxy server: v1.5 final URL base/meta and https auto fallback', async (t)
 
   const stillHealthy = await getJson(base + HEALTH_PATH);
   assert.deepEqual(stillHealthy.json, { ok: true }, 'server survives v1.5 error paths');
+});
+
+// ---------------------------------------------------------------- v1.8 (same-origin mirror)
+
+test('proxy server: v1.8 /site/ mirror and mirror-based /proxy injection', async (t) => {
+  const target = http.createServer(createTargetHandler());
+  const targetPort = await listenServer(target);
+  const targetOrigin = 'http://127.0.0.1:' + targetPort;
+  const hostport = '127.0.0.1:' + targetPort;
+  const mirror = '/site/http/' + hostport + '/';
+
+  const proxy = createAnnotatorServer({ runtimeSource: RUNTIME_STUB });
+  const proxyPort = await listenServer(proxy);
+  const base = 'http://127.0.0.1:' + proxyPort;
+
+  // Small budgets make the /site timeout and oversize paths cheap to test.
+  const tightProxy = createAnnotatorServer({ runtimeSource: RUNTIME_STUB, fetchTimeoutMs: 100 });
+  const tightPort = await listenServer(tightProxy);
+  const tightBase = 'http://127.0.0.1:' + tightPort;
+  const smallProxy = createAnnotatorServer({ runtimeSource: RUNTIME_STUB, binaryLimitBytes: 1024 });
+  const smallPort = await listenServer(smallProxy);
+  const smallBase = 'http://127.0.0.1:' + smallPort;
+
+  t.after(async () => {
+    await closeServer(proxy);
+    await closeServer(tightProxy);
+    await closeServer(smallProxy);
+    await closeServer(target);
+  });
+
+  // --- /site/: bytes, Content-Type, query forwarding --------------------
+  const textAsset = await getText(base + mirror + 'plain');
+  assert.equal(textAsset.status, 200, 'text asset mirrored');
+  assert.match(textAsset.type, /text\/plain/, 'text Content-Type preserved');
+  assert.equal(textAsset.text, 'hello', 'text bytes preserved');
+  assert.equal(textAsset.cache, 'no-store', '/site/ is no-store');
+
+  const binaryResponse = await fetch(base + mirror + 'binary');
+  assert.equal(binaryResponse.status, 200, 'binary asset mirrored');
+  assert.match(
+    binaryResponse.headers.get('content-type') || '',
+    /application\/octet-stream/,
+    'binary Content-Type preserved',
+  );
+  assert.deepEqual(
+    [...Buffer.from(await binaryResponse.arrayBuffer())],
+    [0, 1, 2, 3, 250, 255],
+    'binary bytes preserved',
+  );
+
+  const echoed = await getText(base + mirror + 'echo?x=1&y=2');
+  assert.equal(echoed.status, 200);
+  assert.equal(echoed.text, 'query=?x=1&y=2', 'query forwarded verbatim');
+
+  const moduleAsset = await getText(base + mirror + 'app.js');
+  assert.equal(moduleAsset.status, 200, 'es module script mirrored same-origin');
+  assert.match(moduleAsset.type, /text\/javascript/, 'module MIME preserved');
+  assert.ok(moduleAsset.text.includes('export const mirrored = true'), 'module bytes preserved');
+
+  const root = await getText(base + mirror);
+  assert.equal(root.status, 200, 'empty mirror path maps to the target root');
+  assert.ok(root.text.includes('root page'));
+
+  // --- /site/: CSS absolute URL rewriting ------------------------------
+  const css = await getText(base + mirror + 'site.css');
+  assert.equal(css.status, 200);
+  assert.match(css.type, /text\/css/);
+  assert.ok(
+    css.text.includes('@import "/site/http/' + hostport + '/base.css";'),
+    'quoted @import rewritten',
+  );
+  assert.ok(
+    css.text.includes("@import url('/site/http/" + hostport + "/other.css');"),
+    'url() @import rewritten',
+  );
+  assert.ok(css.text.includes('url(/site/http/' + hostport + '/img/bg.png)'), 'bare url() rewritten');
+  assert.ok(
+    css.text.includes('url("/site/http/' + hostport + '/img/icon.png")'),
+    'quoted url() rewritten',
+  );
+  assert.ok(css.text.includes('url(https://cdn.example/x.png)'), 'absolute http(s) url untouched');
+  assert.ok(css.text.includes('url(data:image/png;base64,AAAA)'), 'data url untouched');
+  assert.ok(
+    css.text.includes('url(/site/http/cdn.example/y.png)'),
+    'protocol-relative url() rewritten to its host mirror',
+  );
+  assert.ok(!css.text.includes('url(/img/'), 'no un-mirrored absolute css url left');
+
+  // --- /site/: nested HTML attribute rewriting -------------------------
+  const nested = await getText(base + mirror + 'nested.html');
+  assert.equal(nested.status, 200);
+  assert.match(nested.type, /text\/html/);
+  assert.ok(
+    nested.text.includes('href="/site/http/' + hostport + '/site.css"'),
+    'nested link href rewritten',
+  );
+  assert.ok(
+    nested.text.includes('src="/site/http/' + hostport + '/pixel.png"'),
+    'nested src rewritten',
+  );
+  assert.ok(
+    nested.text.includes(
+      'srcset="/site/http/' +
+        hostport +
+        '/pixel.png 1x, /site/http/' +
+        hostport +
+        '/big.png 2x"',
+    ),
+    'nested srcset rewritten per candidate',
+  );
+  assert.ok(nested.text.includes('href="/site/http/' + hostport + '/next"'), 'nested anchor rewritten');
+  assert.ok(nested.text.includes('href="https://example.com/x"'), 'nested absolute external untouched');
+  assert.ok(nested.text.includes('href="//cdn.example/z"'), 'nested protocol-relative untouched');
+
+  // --- /site/: error paths ---------------------------------------------
+  const notFound = await getText(base + mirror + 'notfound');
+  assert.equal(notFound.status, 404, 'upstream 404 passed through');
+  assert.equal(notFound.text, 'nope');
+
+  const upstreamError = await getJson(base + mirror + 'boom');
+  assert.equal(upstreamError.status, 502, 'upstream 500 -> 502');
+  assert.equal(upstreamError.json.ok, false);
+
+  for (const bad of [
+    base + '/site/ftp/' + hostport + '/x',
+    base + '/site/http/',
+    base + '/site/http',
+    base + '/site/',
+  ]) {
+    const rejected = await getJson(bad);
+    assert.equal(rejected.status, 400, 'invalid /site path -> 400: ' + bad);
+    assert.equal(rejected.json.ok, false);
+  }
+
+  const tooBig = await getJson(smallBase + mirror + 'site-big');
+  assert.equal(tooBig.status, 502, '/site oversize -> 502');
+  assert.match(tooBig.json.error, /limit/);
+
+  const timedOut = await getJson(tightBase + mirror + 'asset-slow');
+  assert.equal(timedOut.status, 504, '/site timeout -> 504');
+  assert.match(timedOut.json.error, /timed out/);
+
+  const headResponse = await fetch(base + mirror + 'plain', { method: 'HEAD' });
+  assert.equal(headResponse.status, 200, '/site HEAD -> 200');
+  assert.match(headResponse.headers.get('content-type') || '', /text\/plain/);
+  assert.equal(await headResponse.text(), '', 'HEAD has no body');
+
+  const postResponse = await fetch(base + mirror + 'plain', { method: 'POST' });
+  assert.equal(postResponse.status, 405, '/site non-GET -> 405');
+  await postResponse.text();
+
+  // --- /proxy: mirror base + absolute attribute rewriting --------------
+  const page = await getText(base + PROXY_PATH + '?url=' + encodeTarget(targetOrigin + '/abs'));
+  assert.equal(page.status, 200);
+  assert.equal((page.text.match(/<base /g) || []).length, 1, 'exactly one <base> tag');
+  assert.ok(
+    page.text.includes('<base href="' + mirror + '" target="_blank">'),
+    'existing <base> href replaced with the mirror base (attributes kept)',
+  );
+  assert.ok(!page.text.includes('<base href="/sub/"'), 'old base href removed');
+  assert.ok(
+    page.text.includes('<meta name="dsh-web-annotator-url" content="' + targetOrigin + '/abs">'),
+    'meta still carries the real target URL',
+  );
+  assert.ok(
+    page.text.includes('<script type="module" src="' + mirror + 'app.js"></script>'),
+    'module script now loads from the same-origin mirror (no CORS)',
+  );
+  assert.ok(page.text.includes('href="' + mirror + 'style.css"'), 'stylesheet href rewritten');
+  assert.ok(page.text.includes('href="' + mirror + 'next"'), 'absolute anchor href rewritten');
+  assert.ok(page.text.includes('src="' + mirror + 'pixel.png"'), 'img src rewritten');
+  assert.ok(
+    page.text.includes('srcset="' + mirror + 'pixel.png 1x, ' + mirror + 'pixel@2x.png 2x"'),
+    'top-level srcset rewritten',
+  );
+  assert.ok(page.text.includes('action="' + mirror + 'submit"'), 'form action rewritten');
+  assert.ok(page.text.includes('poster="' + mirror + 'poster.png"'), 'video poster rewritten');
+  assert.ok(page.text.includes('href="https://cdn.example/x"'), 'absolute external untouched');
+  assert.ok(page.text.includes('href="//cdn.example/"'), 'protocol-relative untouched in HTML');
+  assert.ok(page.text.includes('href="relative.html"'), 'relative reference untouched');
+  assert.ok(
+    page.text.includes('<script defer src="' + base + RUNTIME_PATH + '"></script>'),
+    'runtime script still injected absolutely',
+  );
+  assert.ok(
+    page.text.indexOf('/runtime.js') < page.text.indexOf('</body>'),
+    'runtime script before body close',
+  );
 });
 
 // ---------------------------------------------------------------- v1.7 (performance)

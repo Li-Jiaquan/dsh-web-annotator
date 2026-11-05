@@ -41,6 +41,8 @@ export const VENDOR_PATH = '/vendor/html2canvas.min.js';
 export const VENDOR_PREFIX = '/vendor/';
 /** Same-origin asset proxy used by html2canvas for cross-origin images. */
 export const ASSET_PATH = '/asset';
+/** Same-origin mirror route for proxied page resources (SPEC §16.1). */
+export const SITE_PATH = '/site/';
 /** Payload version reported by the endpoint route. */
 export const PROTOCOL_VERSION = 1;
 
@@ -120,13 +122,21 @@ export function normalizeTargetUrl(raw, options = {}) {
 
 /**
  * Inject `<base>`, the annotation meta tags and the runtime script into a
- * proxied HTML document. Rules: SPEC.md §2.4 + §14.2.
+ * proxied HTML document. Rules: SPEC.md §2.4 + §14.2 + §16.2.
  *
  * @param {string} html original document.
- * @param {{ targetUrl?: string, finalUrl?: string, runtimePath?: string }} [opts]
- *   `finalUrl` is the post-redirect response URL; it takes precedence over
- *   `targetUrl` for both `<base href>` and the target-URL meta tag (backward
- *   compatible: without it, `targetUrl` is used for both).
+ * @param {{
+ *   targetUrl?: string,
+ *   finalUrl?: string,
+ *   runtimePath?: string,
+ *   baseHref?: string,
+ *   mirrorPrefix?: string,
+ * }} [opts]
+ *   `finalUrl` is the post-redirect response URL and feeds the target-URL meta
+ *   tag. `baseHref` is the injected `<base href>` (v1.8 passes the same-origin
+ *   mirror base, e.g. `/site/http/127.0.0.1:4173/`); it defaults to `finalUrl`
+ *   so pre-v1.8 callers keep working. When `mirrorPrefix` is given, absolute
+ *   path attributes in the document are rewritten through that mirror.
  * @returns {string}
  */
 export function buildProxyDocument(html, opts = {}) {
@@ -136,10 +146,26 @@ export function buildProxyDocument(html, opts = {}) {
     typeof opts?.finalUrl === 'string' && opts.finalUrl !== '' ? opts.finalUrl : targetUrl;
   const runtimePath =
     typeof opts?.runtimePath === 'string' && opts.runtimePath !== '' ? opts.runtimePath : RUNTIME_PATH;
+  const baseHref =
+    typeof opts?.baseHref === 'string' && opts.baseHref !== '' ? opts.baseHref : finalUrl;
+  const explicitBaseHref = typeof opts?.baseHref === 'string' && opts.baseHref !== '';
+  const mirrorPrefix = typeof opts?.mirrorPrefix === 'string' ? opts.mirrorPrefix : '';
+
+  // §16.2: absolute-path resources of the top-level document must also load
+  // through the same-origin mirror (this is what fixes cross-origin
+  // `<script type="module">` CORS failures).
+  if (mirrorPrefix !== '') {
+    document = rewriteHtmlAbsoluteUrls(document, mirrorPrefix);
+  }
 
   const hasBase = /<base\b/i.test(document);
+  if (hasBase && (explicitBaseHref || mirrorPrefix !== '')) {
+    // §16.2: keep the tag/position/attributes, replace only its href.
+    // (Without an explicit v1.8 base, pre-v1.8 callers keep their own base.)
+    document = replaceFirstBaseHref(document, baseHref);
+  }
   // §2.4: no `&` escaping in the base href; §14.2: the meta content is HTML-escaped.
-  const baseTag = `<base href="${escapeHtmlAttribute(finalUrl)}">`;
+  const baseTag = `<base href="${escapeHtmlAttribute(baseHref)}">`;
   const urlMetaTag = `<meta name="${TARGET_URL_META_NAME}" content="${escapeHtmlMetaContent(finalUrl)}">`;
   const headMatch = /<head\b[^>]*>/i.exec(document);
 
@@ -345,6 +371,10 @@ export function createAnnotatorServer(options = {}) {
       }
       if (pathname === ASSET_PATH) {
         await serveAsset(req, res, requestUrl);
+        return;
+      }
+      if (pathname === '/site' || pathname.startsWith(SITE_PATH)) {
+        await serveSite(req, res, requestUrl);
         return;
       }
       if (pathname === PROXY_PATH) {
@@ -711,10 +741,142 @@ export function createAnnotatorServer(options = {}) {
     }
   }
 
+  /**
+   * Parse `/site/<scheme>/<hostport>/<path...>` (SPEC §16.1).
+   * @returns {{ scheme: 'http'|'https', hostport: string, path: string } | { error: string }}
+   */
+  function parseSiteRequest(pathname) {
+    if (typeof pathname !== 'string' || !pathname.startsWith(SITE_PATH)) {
+      return { error: 'invalid /site path' };
+    }
+    const rest = pathname.slice(SITE_PATH.length);
+    const firstSlash = rest.indexOf('/');
+    const scheme = (firstSlash === -1 ? rest : rest.slice(0, firstSlash)).toLowerCase();
+    if (scheme !== 'http' && scheme !== 'https') {
+      return { error: `unsupported scheme: ${scheme || '(none)'}` };
+    }
+    if (firstSlash === -1) return { error: 'missing host in /site path' };
+    const afterScheme = rest.slice(firstSlash + 1);
+    const secondSlash = afterScheme.indexOf('/');
+    const hostport = secondSlash === -1 ? afterScheme : afterScheme.slice(0, secondSlash);
+    const path = secondSlash === -1 ? '/' : afterScheme.slice(secondSlash);
+    if (hostport === '') return { error: 'missing host in /site path' };
+    try {
+      const probe = new URL(`${scheme}://${hostport}/`);
+      if (!probe.hostname || probe.username !== '' || probe.password !== '') {
+        return { error: 'invalid host in /site path' };
+      }
+    } catch {
+      return { error: 'invalid host in /site path' };
+    }
+    return { scheme, hostport, path };
+  }
+
+  /**
+   * `GET|HEAD /site/<scheme>/<hostport>/<path...>[?query]` (SPEC §16.1):
+   * same-origin mirror of one target resource. Bytes and Content-Type are
+   * preserved; CSS/HTML bodies have their absolute paths rewritten through the
+   * mirror so relative/module requests stay same-origin (no CORS).
+   */
+  async function serveSite(req, res, requestUrl) {
+    const parsed = parseSiteRequest(requestUrl.pathname);
+    if ('error' in parsed) {
+      sendJson(req, res, 400, { ok: false, error: parsed.error });
+      return;
+    }
+    const targetUrl = `${parsed.scheme}://${parsed.hostport}${parsed.path}${requestUrl.search}`;
+
+    let response;
+    try {
+      response = await config.fetchImpl(targetUrl, {
+        redirect: 'follow',
+        headers: {
+          'user-agent': 'Mozilla/5.0 (DSH Web Annotator)',
+          accept: '*/*',
+        },
+        signal: AbortSignal.timeout(config.fetchTimeoutMs),
+      });
+    } catch (error) {
+      const name = error && typeof error === 'object' ? error.name : '';
+      if (name === 'TimeoutError' || name === 'AbortError') {
+        sendJson(req, res, 504, {
+          ok: false,
+          error: `mirror request timed out after ${Math.round(config.fetchTimeoutMs / 1000)}s`,
+        });
+        return;
+      }
+      sendJson(req, res, 502, {
+        ok: false,
+        error: describeFetchFailure(error, config.fetchTimeoutMs),
+      });
+      return;
+    }
+
+    if (!response || typeof response.status !== 'number') {
+      sendJson(req, res, 502, { ok: false, error: 'mirror request failed: empty response' });
+      return;
+    }
+    if (response.status >= 500) {
+      cancelResponseBody(response);
+      sendJson(req, res, 502, {
+        ok: false,
+        error: `target responded with HTTP ${response.status}`,
+      });
+      return;
+    }
+
+    const contentTypeHeader =
+      typeof response.headers?.get === 'function' ? response.headers.get('content-type') || '' : '';
+    const contentType = contentTypeHeader.toLowerCase();
+    const finalUrl =
+      typeof response.url === 'string' && response.url !== '' ? response.url : targetUrl;
+    const mirrorPrefix =
+      mirrorBaseForUrl(finalUrl) || `/site/${parsed.scheme}/${parsed.hostport}/`;
+    const mirrorScheme = finalUrl.startsWith('https:') ? 'https' : parsed.scheme;
+
+    try {
+      const buffer = await readResponseBuffer(response, config.binaryLimitBytes);
+      let body = buffer;
+      if (contentType.includes('text/css')) {
+        body = Buffer.from(
+          rewriteCssAbsoluteUrls(buffer.toString('utf8'), mirrorPrefix, mirrorScheme),
+          'utf8',
+        );
+      } else if (contentType.includes('text/html')) {
+        body = Buffer.from(rewriteHtmlAbsoluteUrls(buffer.toString('utf8'), mirrorPrefix), 'utf8');
+      }
+      writeResponse(
+        req,
+        res,
+        response.status,
+        {
+          'content-type': contentTypeHeader || 'application/octet-stream',
+          'cache-control': 'no-store',
+        },
+        body,
+      );
+    } catch (error) {
+      cancelResponseBody(response);
+      if (error instanceof BodyTooLargeError) {
+        sendJson(req, res, 502, { ok: false, error: error.message });
+        return;
+      }
+      sendJson(req, res, 502, {
+        ok: false,
+        error: `failed to read mirror response: ${messageOf(error)}`,
+      });
+    }
+  }
+
   function sendHtmlDocument(req, res, html, finalUrl) {
+    // §16.2: point <base> and absolute-path resources at the same-origin
+    // mirror instead of the target origin; the meta tag keeps the real URL.
+    const mirrorBase = mirrorBaseForUrl(finalUrl);
     const document = buildProxyDocument(html, {
       targetUrl: finalUrl,
       finalUrl,
+      baseHref: mirrorBase !== '' ? mirrorBase : finalUrl,
+      mirrorPrefix: mirrorBase,
       runtimePath: runtimeScriptSrc(),
     });
     writeResponse(req, res, 200, { 'content-type': 'text/html; charset=utf-8' }, document);
@@ -1258,6 +1420,160 @@ function escapeHtmlMetaContent(value) {
     .replace(/"/g, '&quot;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
+}
+
+/**
+ * Mirror base for a target URL, e.g. `https://127.0.0.1:4173/x` →
+ * `/site/https/127.0.0.1:4173/` (SPEC §16.2). Empty for non-http(s) URLs.
+ *
+ * @param {string} url
+ * @returns {string}
+ */
+function mirrorBaseForUrl(url) {
+  try {
+    const parsed = new URL(String(url));
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return '';
+    const scheme = parsed.protocol === 'https:' ? 'https' : 'http';
+    return `/site/${scheme}/${parsed.host}/`;
+  } catch {
+    return '';
+  }
+}
+
+/** Rewrite one single-slash absolute path through the mirror; `null` = keep. */
+function rewriteMirrorPathValue(value, mirrorPrefix) {
+  if (typeof value !== 'string' || value.length < 2) return null;
+  if (value[0] !== '/') return null;
+  // `//host/...` is protocol-relative; HTML rule only rewrites single `/`.
+  if (value[1] === '/') return null;
+  if (mirrorPrefix === '' || value.startsWith(mirrorPrefix)) return null;
+  return mirrorPrefix + value.slice(1);
+}
+
+/** Rewrite `srcset` candidates (absolute paths only); `null` = keep original. */
+function rewriteMirrorSrcset(value, mirrorPrefix) {
+  if (typeof value !== 'string' || value === '') return null;
+  let changed = false;
+  const rewritten = value.split(',').map((part) => {
+    const leading = /^\s*/.exec(part)[0];
+    const trailing = /\s*$/.exec(part)[0];
+    const core = part.slice(leading.length, part.length - trailing.length);
+    if (core === '') return part;
+    const spaceIndex = core.search(/\s/);
+    const url = spaceIndex === -1 ? core : core.slice(0, spaceIndex);
+    const descriptor = spaceIndex === -1 ? '' : core.slice(spaceIndex);
+    const nextUrl = rewriteMirrorPathValue(url, mirrorPrefix);
+    if (nextUrl === null) return part;
+    changed = true;
+    return `${leading}${nextUrl}${descriptor}${trailing}`;
+  });
+  return changed ? rewritten.join(',') : null;
+}
+
+/** Rewrite absolute path attributes inside one HTML tag (SPEC §16.1/§16.2). */
+function rewriteHtmlTagAbsoluteUrls(tag, mirrorPrefix) {
+  let output = tag.replace(
+    /(\s)(src|href|poster|action|formaction)(\s*=\s*)("([^"]*)"|'([^']*)')/gi,
+    (match, lead, name, equals, quoted, doubleQuoted, singleQuoted) => {
+      const value = doubleQuoted !== undefined ? doubleQuoted : singleQuoted;
+      const rewritten = rewriteMirrorPathValue(value, mirrorPrefix);
+      if (rewritten === null) return match;
+      const quote = quoted[0];
+      return `${lead}${name}${equals}${quote}${rewritten}${quote}`;
+    },
+  );
+  output = output.replace(
+    /(\s)(srcset)(\s*=\s*)("([^"]*)"|'([^']*)')/gi,
+    (match, lead, name, equals, quoted, doubleQuoted, singleQuoted) => {
+      const value = doubleQuoted !== undefined ? doubleQuoted : singleQuoted;
+      const rewritten = rewriteMirrorSrcset(value, mirrorPrefix);
+      if (rewritten === null) return match;
+      const quote = quoted[0];
+      return `${lead}${name}${equals}${quote}${rewritten}${quote}`;
+    },
+  );
+  return output;
+}
+
+/**
+ * Rewrite absolute-path resource attributes of an HTML document (nested
+ * documents served through `/site/` and the top-level `/proxy` document alike).
+ *
+ * @param {string} document
+ * @param {string} mirrorPrefix e.g. `/site/http/127.0.0.1:4173/`
+ * @returns {string}
+ */
+function rewriteHtmlAbsoluteUrls(document, mirrorPrefix) {
+  if (mirrorPrefix === '' || typeof document !== 'string' || document === '') return document;
+  return document.replace(/<[a-zA-Z][^>]*>/g, (tag) =>
+    rewriteHtmlTagAbsoluteUrls(tag, mirrorPrefix),
+  );
+}
+
+/**
+ * Rewrite absolute paths in a CSS document to the same-origin mirror
+ * (SPEC §16.1): `url(/x)`, `url("/x")`, `@import "/x"`, protocol-relative
+ * `url(//host/x)`; `data:` / absolute `http(s):` URLs are left alone.
+ *
+ * @param {string} css
+ * @param {string} mirrorPrefix e.g. `/site/http/127.0.0.1:4173/`
+ * @param {'http'|'https'} scheme scheme used for protocol-relative URLs
+ * @returns {string}
+ */
+function rewriteCssAbsoluteUrls(css, mirrorPrefix, scheme) {
+  if (typeof css !== 'string' || css === '' || mirrorPrefix === '') return css;
+  const normalizeScheme = scheme === 'https' ? 'https' : 'http';
+  const rewrite = (value) => {
+    if (typeof value !== 'string' || !value.startsWith('/')) return null;
+    if (value.startsWith('//')) {
+      // `//host/path` -> `/site/<scheme>/<host>/path` (same-origin mirror).
+      const withoutLeading = value.slice(2);
+      const slash = withoutLeading.indexOf('/');
+      const host = slash === -1 ? withoutLeading : withoutLeading.slice(0, slash);
+      if (host === '') return null;
+      const rest = slash === -1 ? '/' : withoutLeading.slice(slash);
+      return `/site/${normalizeScheme}/${host}${rest}`;
+    }
+    if (value.startsWith(mirrorPrefix)) return null;
+    return mirrorPrefix + value.slice(1);
+  };
+
+  let output = css.replace(
+    /url\(\s*("([^"]*)"|'([^']*)'|([^)\s'"]+))\s*\)/gi,
+    (match, quoted, doubleQuoted, singleQuoted, bare) => {
+      const value =
+        doubleQuoted !== undefined ? doubleQuoted : singleQuoted !== undefined ? singleQuoted : bare;
+      const rewritten = rewrite(value);
+      if (rewritten === null) return match;
+      const quote = doubleQuoted !== undefined ? '"' : singleQuoted !== undefined ? "'" : '';
+      return `url(${quote}${rewritten}${quote})`;
+    },
+  );
+  output = output.replace(
+    /@import\s+("([^"]*)"|'([^']*)')/gi,
+    (match, quoted, doubleQuoted, singleQuoted) => {
+      const value = doubleQuoted !== undefined ? doubleQuoted : singleQuoted;
+      const rewritten = rewrite(value);
+      if (rewritten === null) return match;
+      const quote = doubleQuoted !== undefined ? '"' : "'";
+      return `@import ${quote}${rewritten}${quote}`;
+    },
+  );
+  return output;
+}
+
+/** Replace only the href of the first `<base>` tag, keeping its position/attrs. */
+function replaceFirstBaseHref(document, href) {
+  const escaped = escapeHtmlAttribute(href);
+  return document.replace(/<base\b[^>]*>/i, (tag) => {
+    if (/\shref\s*=/i.test(tag)) {
+      return tag.replace(
+        /(\shref\s*=\s*)("[^"]*"|'[^']*')/i,
+        (match, lead, quoted) => `${lead}${quoted[0]}${escaped}${quoted[0]}`,
+      );
+    }
+    return tag.replace(/<base\b/i, `<base href="${escaped}"`);
+  });
 }
 
 function insertAtDocumentFront(document, snippet) {

@@ -525,3 +525,40 @@ Lead `test/accept.mjs` 增加：`/vendor/html2canvas.min.js` 200 且长度 > 100
 ### 15.5 测试
 - client 静态：断言存在 back/forward/reload 按钮与 title/aria；历史逻辑（push 截断前进项、相同 URL 不重复入栈、back/forward 索引变化、加载 URL 形状含 auto 与 `_r`）；disabled 状态；后退/前进/刷新都会触发清空批注；22 项左右，全过；`node --check client.js`。
 - Lead accept：断言 client 含 `toolbar.back`/`toolbar.forward`/`_r` 历史/刷新实现；其余不变。
+
+## 16. v1.8：同源镜像代理，修复 ES module 页面在批注窗口失效（冻结）
+
+用户反馈：`http://127.0.0.1:4173/` 这类页面在批注窗口里「失效」（交互全无）。诊断结论：页面用 `<script type="module" src="app.js">`，而 `/proxy` 注入的 `<base href="目标URL">` 让 `app.js` 从**目标 origin** 加载——跨源模块脚本被 CORS 拦截（目标 dev server 无 `Access-Control-Allow-Origin`），`app.js` 从未执行，页面静态可看但 JS 全失效。DSH 内置浏览器没有运行时注入点，无法替代批注；因此把代理改成「同源镜像」。
+
+### 16.1 宿主新路由 `/site/`（index.js）
+- `GET/HEAD /site/<scheme>/<hostport>/<path...>[?query]`：
+  - `scheme` ∈ {http,https}；`hostport` = 主机[:端口]（IPv6 用 `[::1]`）；`path` 可为空（等价 `/`）；query 原样转发到目标 URL。
+  - 语义与 `/proxy` 的资源获取一致：15s 超时、20MB 上限、跟随重定向（用最终响应 URL 相对路径时以上游最终 URL 为准，简单实现：直接返回最终字节）、错误码 502/504/400 与 `/proxy` 一致；`Cache-Control: no-store`；非 GET/HEAD → 405。
+  - 响应头保留上游 `Content-Type`（缺失时 `application/octet-stream`）；仅透传安全头（content-type/content-length/缓存不转发）。
+  - **CSS 响应**（`text/css`）：把代码里的绝对路径 `url(/...)`、`url("/...")`、`@import "/..."` 重写为 `/site/<scheme>/<hostport>/...`（`//host` 协议相对也重写；`data:`/`http(s):` 绝对 URL 不改）。
+  - **HTML 响应**（`text/html`，嵌套文档）：把 `src|href|poster|action|formaction` 以单个 `/` 开头的属性值重写为 `/site/<scheme>/<hostport>/...`；`srcset` 同理（逐项）。
+- 单测：GET 二进制/文本字节一致、Content-Type 保留、query 转发、CSS 绝对 url 重写、HTML 绝对属性重写、404/500/超时/过大/非法 scheme 行为、HEAD 无 body。
+
+### 16.2 `/proxy` 文档注入变更
+- `<base href="{proxyOrigin}/site/{scheme}/{hostport}/">`（不再指向目标 origin；使用根相对路径保证任何代理端口都正确）。
+- `<meta name="dsh-web-annotator-url">` 仍为**最终目标 URL**（address bar / navigate 用）。
+- 顶层 HTML 的绝对路径资源属性（`src|href|poster|action|formaction` 以 `/` 开头且非 `//`）重写为 `/site/<scheme>/<hostport>/...`；`srcset` 同理。目标页已有 `<base>` 时：把该 base 的 href 解析为绝对地址后 **替换成镜像基址**（保留 `<base>` 位置与其它属性）。
+- 运行时脚本注入、CSP/XFO 剥离、`auto=1` 协议回退、最终 URL/meta 逻辑不变。
+- 注意 base 变化意味着**所有相对资源都走 `/site/` 同源镜像**（模块、字体、图片都不再有 CORS 问题）；绝对 URL（`https://cdn/...`）保持直连（图片等由 html2canvas `/asset` 代理处理）。
+
+### 16.3 runtime 的 navigate 目标推导（runtime.js）
+- 由于文档 base 变为镜像路径，`a.href` 会解析成 `proxyOrigin/site/...` 镜像 URL。点击拦截与 `window.open` 日志的 `url` 必须改成：
+  - 取锚点**原始属性值**（`getAttribute('href')`）或 `window.open` 的入参字符串；
+  - 以 `<meta name="dsh-web-annotator-url">`（或 location `?url=` 解码，兜底 `location.href`）对应的**目标 URL** 为 base 用 `new URL(raw, targetUrl)` 解析；
+  - 仅 http(s)、非纯 hash、非 `javascript:` 才发 `navigate`。
+- 测试：运行时页面注入目标 meta（如 `https://example.test/base/`），点击 `href="next"` → navigate.url=`https://example.test/base/next`；`href="/x"` → `https://example.test/x`；绝对 http(s) 与 hash/javascript 用例保持；原 navigate/ready 断言保持。
+
+### 16.4 client 不变
+- 协议无变化；地址栏/历史仍用目标 URL（ready.url / navigate.url）。
+- `iframe src` 仍是 `{proxyOrigin}/proxy?url=...`。
+
+### 16.5 验收
+- host 测试更新：base 断言从目标 origin 改为 `/site/<scheme>/<hostport>/`；新增 v1.8 `/site/` 用例；原 12 项语义保留。
+- runtime 测试：新增 navigate 目标推导用例（meta base），其余套件保持通过。
+- **真实页面验收**：`http://127.0.0.1:4173/` 经插件代理加载后：`app.js` 正常执行（无 CORS 错误、console 无 error），页面交互（如点击导航按钮切换 data-page/显示变化）可用；整页截图仍能渲染。
+- Lead accept：断言 host.js 含 `/site/` 路由、base 注入为 mirror；runtime 含目标 URL 推导；其余不变。

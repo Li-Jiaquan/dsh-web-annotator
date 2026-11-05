@@ -231,6 +231,17 @@ async function startHostLikeServer(originB) {
             '<div style="height:2600px"></div>\n    <script src="/runtime.js"></script>',
           );
         }
+        if (requestUrl.searchParams.get('mirrorbase') === '1') {
+          // v1.8: simulate the same-origin mirror document: a /site/ <base>
+          // (so anchor.href would be a mirror URL) + the real target URL meta.
+          const hostHeader = req.headers.host || '127.0.0.1';
+          html = html.replace(
+            '</head>',
+            '<base href="/site/http/' +
+              hostHeader +
+              '/" />\n  <meta name="dsh-web-annotator-url" content="https://example.test/base/" />\n  </head>',
+          );
+        }
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
         res.end(html);
         return;
@@ -363,6 +374,10 @@ const staticChecks = [
   ['v1.5 ready carries the target url', source.includes('url: truncate(targetUrlFromDocument()')],
   ['v1.5 link click interception', source.includes('function onDocumentClickCapture') && source.includes('stopImmediatePropagation')],
   ['v1.5 window.open bridge', source.includes('function installWindowOpenBridge') && source.includes('originalOpen.apply')],
+  [
+    'v1.8 navigate resolves the raw href against the target URL base',
+    source.includes('baseUrl = targetUrlFromDocument()') && source.includes("anchor.getAttribute('href')"),
+  ],
 ];
 
 for (const [name, ok] of staticChecks) check(name, ok);
@@ -582,6 +597,43 @@ try {
     attrOf(htmlQuery, 'data-test-ready-url-value'),
   );
   console.log(`    ready url (query):  ${attrOf(htmlQuery, 'data-test-ready-url-value')}`);
+
+  /* ---- run 1e: v1.8 mirror <base> must not leak into navigate URLs ---- */
+  const mirrorBaseUrl = `${host.origin}/page?mirrorbase=1`;
+  const runMirror = await runHeadless(browser, mirrorBaseUrl, 30000);
+  const htmlMirror = runMirror.stdout || '';
+  const statusMirror = attrOf(htmlMirror, 'data-test-status');
+  check('mirror base: harness completed', statusMirror !== null, 'no data-test-status attribute');
+  check('mirror base: harness status is pass', statusMirror === 'pass', statusMirror === null ? 'missing' : `status=${statusMirror}`);
+  if (statusMirror === 'fail') {
+    console.log(`  mirror base failed step: ${attrOf(htmlMirror, 'data-test-failed-step') || '(unknown)'}`);
+  }
+  check('mirror base: fixture anchor.href is a /site/ mirror URL', attrOf(htmlMirror, 'data-test-mirror-base-installed') === '1', attrOf(htmlMirror, 'data-test-mirror-anchor-href'));
+  check('mirror base: ready.url still the target URL from meta', attrOf(htmlMirror, 'data-test-mirror-ready-url-meta') === '1', attrOf(htmlMirror, 'data-test-mirror-ready-url'));
+  check(
+    'mirror base: href="next" navigates to the target URL, not the mirror URL',
+    attrOf(htmlMirror, 'data-test-mirror-relative') === '1' &&
+      attrOf(htmlMirror, 'data-test-mirror-relative-default-prevented') === '1',
+    attrOf(htmlMirror, 'data-test-mirror-relative-url'),
+  );
+  check(
+    'mirror base: href="/x" navigates to the target origin root',
+    attrOf(htmlMirror, 'data-test-mirror-root-relative') === '1',
+    attrOf(htmlMirror, 'data-test-mirror-root-url'),
+  );
+  check('mirror base: absolute https link unchanged', attrOf(htmlMirror, 'data-test-mirror-absolute') === '1');
+  check('mirror base: javascript: link still ignored', attrOf(htmlMirror, 'data-test-mirror-javascript-ignored') === '1');
+  check(
+    'mirror base: window.open(relative) resolves against the target URL',
+    attrOf(htmlMirror, 'data-test-mirror-window-open') === '1' && attrOf(htmlMirror, 'data-test-mirror-window-open-null') === '1',
+    attrOf(htmlMirror, 'data-test-mirror-window-open-url'),
+  );
+  check('mirror base: window.open(absolute https) unchanged', attrOf(htmlMirror, 'data-test-mirror-window-open-absolute') === '1');
+  check('mirror base: no page/runtime errors', attrOf(htmlMirror, 'data-test-no-errors') === '1');
+  console.log(`    mirror anchor.href: ${attrOf(htmlMirror, 'data-test-mirror-anchor-href')}`);
+  console.log(`    mirror navigate url: ${attrOf(htmlMirror, 'data-test-mirror-relative-url')}`);
+  console.log(`    mirror root-relative: ${attrOf(htmlMirror, 'data-test-mirror-root-url')}`);
+  console.log(`    mirror window.open:  ${attrOf(htmlMirror, 'data-test-mirror-window-open-url')}`);
 
   /* ---- run 2: html2canvas unavailable (vendor 404) ---- */
   await fetch(`${host.origin}/__control/vendor-fail`);
