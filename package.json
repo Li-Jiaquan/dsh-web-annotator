@@ -2,6 +2,7 @@
   "name": "@local/dsh-web-annotator",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "description": "In-app web page annotation for DSH: annotate elements, areas and text in a proxied web page preview, then send structured comments to the agent.",
   "exports": {
@@ -19,7 +20,9 @@
     "cordis.patch.yml",
     "locale/*.json",
     "vendor/*",
-    "icon.svg"
+    "icon.svg",
+    "LICENSE",
+    "README.md"
   ],
   "dsh": {
     "manifestVersion": 1,

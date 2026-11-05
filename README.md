@@ -2,6 +2,34 @@
 
 给 DeepSeek Harness Web UI 增加 Codex 风格的「网页批注」：在会话里打开一个网页预览，点选元素、框选区域或拖选文本，填写意见后一键发给当前 Agent。
 
+## 安装（plugin_manager install_bundle）
+
+本项目是一个 **DSH 本地 bundle 插件**，通过 DSH 自带的插件管理器以「本地目录」方式安装；**不要手工编辑 profile 的 `package.json` / `cordis.patch.yml`**。
+
+**环境要求**：DSH NEXT 2.0.11-next 及以上（本项目在 2.0.21-next 上开发验证）；Node/pnpm 随 DSH 自带，插件本身无第三方运行时依赖（仅内置了 MIT 协议的 html2canvas 1.4.1 静态资源）。
+
+**安装步骤**：
+
+1. 把本目录放到任意位置（保留完整目录，含 `index.js` / `runtime.js` / `client.js` / `vendor/`），或直接使用现有路径。
+2. 在 DSH 任意会话中，让 Agent 用 `plugin_manager` 工具安装本地 bundle：
+
+   ```jsonc
+   {
+     "action": "install_bundle",
+     "target": "C:\\Users\\ljq\\DeskBox\\虚拟桌面\\新建\\dsh-web-annotator"
+   }
+   ```
+
+   `target` 填**本目录的绝对路径**。该操作会：把 `@local/dsh-web-annotator` 写成 profile 依赖（`link:<目录>`）→ 把 bundle 加入 `dsh.profile.bundles` → 执行 `pnpm install`。
+3. **完全退出并重新启动 DSH NEXT**（宿主半代码在进程启动时加载，只刷新窗口不够）。
+4. 打开任意会话：点会话头部「批注」按钮，或右侧栏打开「网页批注」标签，即可进入批注视图。
+
+**更新 / 维护**：
+
+- 本插件目录以 `link:` 方式接入 profile，修改代码后：`client.js` 通常会热更新，`runtime.js` 每次请求现读，**`index.js`（宿主半）改动需要重启 DSH NEXT**。
+- 若入口消失（插件在 profile 里被禁用），对同一 target 执行 `plugin_manager.set_bundle`（`enabled: true`）重新启用，**不要手工编辑 profile**。
+- 卸载：对 target `@local/dsh-web-annotator` 执行 `plugin_manager.remove_bundle`，重启 DSH NEXT。
+
 ## 入口（3 处）
 
 1. **会话头部右侧「批注」按钮**：点一下会展开右栏并打开「网页批注」标签页；如果内置浏览器正开着，会尽量把它当前的地址带过来（best-effort，失败则用默认地址）。
@@ -10,7 +38,7 @@
 
 > 内置「浏览器」标签页的工具栏属于官方插件、没有对外扩展点，无法把按钮直接加进那条工具栏；因此入口放在会话头部与右侧栏，二者都能一键到达批注页。
 
-## 使用（v1.2 交互）
+## 使用
 
 1. **重启一次 DSH Desktop**（新安装的客户端插件需要重新加载；仅在窗口内刷新可能不够）。
 2. 打开任意会话，点会话头部「批注」，或在右侧栏打开「网页批注」。
@@ -70,3 +98,9 @@ node test/accept.mjs             # 22/22 Lead 验收：清单/图标/语法/协�
 ```
 
 接口契约见 `SPEC.md`（冻结）：§0-§9 为 v1.0 基础协议，§10 为 v1.1 截图附件，§11 为 v1.2 页面内悬浮评论窗交互，§12 为 v1.3 空格穿透 + 整页标注截图，§13 为 v1.4 状态栏精简 + 写入对话框，§14 为 v1.5 地址栏自动协议 + 链接跳转，§15 为 v1.6 浏览器式 后退/前进/刷新。
+
+## License
+
+MIT，见 [LICENSE](./LICENSE)。
+
+内置的 `vendor/html2canvas.min.js`（1.4.1）由 html2canvas 项目以 MIT 协议发布，其许可证文件见 [vendor/html2canvas.LICENSE](./vendor/html2canvas.LICENSE)。
