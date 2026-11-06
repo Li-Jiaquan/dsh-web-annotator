@@ -263,7 +263,7 @@ DOM 路径: {elementPath}
 
 ## 7. 已知事实（供实现参考，不要重复探索）
 
-- DSH 本机安装：`C:\Users\ljq\AppData\Local\Programs\DSH NEXT\resources\app.asar`（Electron，版本 2.0.21-next；插件 API 版本 `@deepseek-ai/dsh 0.2.1-rc.4`）。
+- DSH 本机安装：`C:/Users/<user>\AppData\Local\Programs\DSH NEXT\resources\app.asar`（Electron，版本 2.0.21-next；插件 API 版本 `@deepseek-ai/dsh 0.2.1-rc.4`）。
 - Harness Web GUI：`http://127.0.0.1:51319`（需要认证；`/`、`/index.html`、`/api/*` 401，但**插件注册的路径返回 404 而不是 401**，即插件路由不受该认证拦截；用 curl 直接测路由时可能因 404/401 误判，优先用单元测试）。
 - 客户端插件可用的基础模块：`require('react')`；服务通过 `inject`/`ctx.get` 获取（`slots`、`locale`、`sessions`、`timer`、`theme`、`layout`）。
 - 槽位注册：`ctx.slots.inject(key, () => ctx.slots.register(options, Component))`；list 槽的 `options` 为 `{name, id, order?, label?}`。
@@ -271,7 +271,7 @@ DOM 路径: {elementPath}
 - 本地化：`ctx.locale.register(NS, {zh, en})` + `ctx.locale.bind(NS)`（shipped 包同样用法）。
 - 宿主插件：`export const inject = ['webServer']; export function apply(ctx, config)`；`ctx.effect(fn)` 返回清理；路由 API：`ctx.webServer.register({ kind:'exact'|'prefix', path, handler(req,res) })`。
 - 宿主侧 Node 22 有全局 `fetch`/`AbortSignal.timeout`；不得加第三方依赖。
-- 文档/模板可参考：`C:\Users\ljq\AppData\Local\Programs\DSH NEXT\resources\app.asar.unpacked\node_modules\@deepseek-ai\dsh-agent-preset\skills\cordis-plugin-development\references\`（用 read 工具读，别用 shell 列目录）。
+- 文档/模板可参考：`C:/Users/<user>\AppData\Local\Programs\DSH NEXT\resources\app.asar.unpacked\node_modules\@deepseek-ai\dsh-agent-preset\skills\cordis-plugin-development\references\`（用 read 工具读，别用 shell 列目录）。
 
 ## 8. 安全/健壮性底线
 
@@ -332,7 +332,7 @@ DOM 路径: {elementPath}
 ### 10.4 客户端行为（client.js）
 1. 发送链路：点「发送给 Agent」后
    - 若「附带截图」开关为开（默认开）且有批注：发 `capture-screenshots`（随机 `requestId`，`ids`=全部批注 id），15s 超时；失败/超时按“无截图”继续并在状态栏提示。
-   - 每个 `dataUrl` 转 PNG `File`（`screenshot-<n>.png`，n 从 1 起的批注序号），作为会话附件加入输入框：使用 `inputActions` 的附件能力。**NEXT 版 `addAttachments(ids)` 接收的是附件 id**：需先经客户端附件通道上传得到 id；实现前用 `cordis_inspect_query`（Client `Service.listService`）与 `C:\Users\ljq\AppData\Local\Temp\asar-probe.mjs` 读 asar 内 `dsh-client-ui-attachment/lib/client.js`、`dsh-client-ui-conversation/lib/client.js` 核准真实 API。若确实无可用上传通道，降级为无截图并在状态栏提示（不得让发送失败）。
+   - 每个 `dataUrl` 转 PNG `File`（`screenshot-<n>.png`，n 从 1 起的批注序号），作为会话附件加入输入框：使用 `inputActions` 的附件能力。**NEXT 版 `addAttachments(ids)` 接收的是附件 id**：需先经客户端附件通道上传得到 id；实现前用 `cordis_inspect_query`（Client `Service.listService`）与 `C:/Users/<user>\AppData\Local\Temp\asar-probe.mjs` 读 asar 内 `dsh-client-ui-attachment/lib/client.js`、`dsh-client-ui-conversation/lib/client.js` 核准真实 API。若确实无可用上传通道，降级为无截图并在状态栏提示（不得让发送失败）。
    - 提示词：按 §10.5 增加固定声明与每条批注的 `截图:` 行；然后 `setDraft → 加附件 → submit → openView('chat')`（顺序沿用现状，附件须在 submit 前就位）。
 2. UI：工具栏「附带截图」开关（`toolbar.screenshots`，默认开）；发送中禁用；状态文案 `status.capturing`/`status.captureFailed`；面板每条批注显示缩略图（已捕获时）。
 3. 本地化新增键（zh/en 键集一致）：`toolbar.screenshots`、`status.capturing`、`status.captureFailed`、`panel.screenshotAlt`、`prompt.screenshotHeader`、`prompt.screenshotLine`。

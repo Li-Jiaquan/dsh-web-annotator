@@ -31,7 +31,7 @@ Requires DSH NEXT 2.0.11-next or later. The desktop screenshot workflow was test
 1. Enter a URL and press **Enter**. For a local development server, try `http://localhost:3000`.
 2. Turn on annotation mode. Click an element, hold **Shift** and drag to mark a region, or drag to select text.
 3. Click a numbered marker to write, edit, or delete its comment. Hold **Space** in annotation mode to interact with the page temporarily.
-4. Click **Write to chat**. Review the appended text and optional `screenshot-page.png` in the composer, then send it when ready.
+4. Click **Write to composer**. Review the appended text and optional `screenshot-page.png` in the composer, then send it when ready.
 
 Screenshot attachments are enabled by default. DSH NEXT can capture the visible webpage directly. Offscreen annotations and environments without native capture use local rendering. Turn off **Screenshots** for a text-only draft.
 
