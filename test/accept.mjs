@@ -48,7 +48,7 @@ async function getText(url) {
 // ---------------------------------------------------------------- manifest
 await check('package.json is valid and declares the bundle + client', () => {
   const pkg = JSON.parse(read('package.json'));
-  assert(pkg.name === 'dsh-web-annotator', 'name');
+  assert(pkg.name === '@li-jiaquan/dsh-web-annotator', 'name');
   assert(pkg.type === 'module', 'type module');
   assert(pkg.dsh && pkg.dsh.bundle && pkg.dsh.bundle.patch === './cordis.patch.yml', 'dsh.bundle.patch');
   assert(pkg.dsh.client && pkg.dsh.client.platform === 'web', 'dsh.client.platform');
@@ -65,7 +65,7 @@ await check('cordis.patch.yml inserts exactly one web-annotator row', () => {
   const yaml = read('cordis.patch.yml');
   assert(/- insert:/.test(yaml), 'has insert');
   assert(/id:\s*web-annotator/.test(yaml), 'row id web-annotator');
-  assert(/name:\s*dsh-web-annotator/.test(yaml), 'row package name');
+  assert(/name:\s*'@li-jiaquan\/dsh-web-annotator'/.test(yaml), 'row package name');
   return 'ok';
 });
 

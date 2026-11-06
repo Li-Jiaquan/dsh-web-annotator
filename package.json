@@ -1,5 +1,5 @@
 {
-  "name": "dsh-web-annotator",
+  "name": "@li-jiaquan/dsh-web-annotator",
   "version": "0.1.0",
   "license": "MIT",
   "type": "module",
@@ -17,6 +17,9 @@
     "dsh-plugin",
     "web-annotation"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",

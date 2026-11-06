@@ -1195,7 +1195,7 @@ function collectClientModulesDiagnostics(modules) {
     const graph = typeof modules.graph === 'function' ? modules.graph() : undefined;
     const ids = graph && Array.isArray(graph.entries) ? graph.entries.map((row) => row && row.id) : null;
     result.graphEntryIds = ids;
-    result.hasOurPackage = Array.isArray(ids) && ids.includes('dsh-web-annotator');
+    result.hasOurPackage = Array.isArray(ids) && ids.includes('@li-jiaquan/dsh-web-annotator');
   } catch (error) {
     result.graphError = messageOf(error);
   }

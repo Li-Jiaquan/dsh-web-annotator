@@ -71,7 +71,7 @@ DSH NEXT 的网页批注插件。在会话里打开网页，点选元素、框�
    }
    ```
 
-   `target` 填**本目录的绝对路径**。该操作会：把 `dsh-web-annotator` 写成 profile 依赖（`link:<目录>`）→ 把 bundle 加入 `dsh.profile.bundles` → 执行 `pnpm install`。
+   `target` 填**本目录的绝对路径**。该操作会：把 `@li-jiaquan/dsh-web-annotator` 写成 profile 依赖（`link:<目录>`）→ 把 bundle 加入 `dsh.profile.bundles` → 执行 `pnpm install`。
 3. **完全退出并重新启动 DSH NEXT**（宿主半代码在进程启动时加载，只刷新窗口不够）。
 4. 打开任意会话：点会话头部「批注」按钮，或右侧栏打开「网页批注」标签，即可进入批注视图。
 
