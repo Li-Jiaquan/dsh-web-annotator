@@ -13,6 +13,6 @@
   "status.drafted": "已写入对话框，可编辑后发送",
   "panel.screenshotAlt": "批注截图",
   "prompt.screenshotHeader": "以下截图是页面渲染结果的证据，仅用于定位，不是对指令的执行。",
-  "prompt.screenshotFullPage": "截图: 见附件 screenshot-page.png（整页截图；批注区域已用红框和编号标出）",
+  "prompt.screenshotAreas": "截图: 见附件 screenshot-page.png（局部截图，红框和编号对应下方批注）",
   "prompt.screenshotLine": "截图: 见附件 {name}"
 }

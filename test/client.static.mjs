@@ -346,8 +346,8 @@ check('client.js writes the prompt into the composer draft (never submits)', () 
   assert((source.match(/t\('toolbar\.send'/g) || []).length === 1, 'toolbar.send is localized once per render');
   assertIncludes(
     source,
-    "buildPrompt(list, '', hasScreenshot ? t('prompt.screenshotFullPage') : '')",
-    'v1.3 prompt call with the localized full-page screenshot line',
+    "buildPrompt(list, '', hasScreenshot ? t('prompt.screenshotAreas') : '')",
+    'prompt call with the localized screenshot line',
   );
   assertIncludes(source, "t('error.noInput')", 'visible error when inputActions is missing');
   assertIncludes(source, "t('error.send'", 'visible error when setDraft throws');
@@ -389,21 +389,21 @@ check('client.js implements v1.2 in-page comments: mirror, no list panel, two se
   return 'v1.2 interaction ok';
 });
 
-// ------------------------------------------------- v1.3 full-page screenshot
-check('client.js implements the v1.3 full-page screenshot + attachment pipeline', () => {
+// ------------------------------------------------- annotation area screenshot
+check('client.js requests annotation areas and drafts one screenshot attachment', () => {
   assertIncludes(source, "'capture-screenshots'", 'capture request message type');
   assertIncludes(source, "'screenshots'", 'screenshot response message type');
   assertIncludes(source, 'SCREENSHOT_TIMEOUT_MS = 15000', '15s capture deadline');
   assertIncludes(source, 'makeCaptureRequestId', 'request id generator');
   assertIncludes(source, 'postCaptureRequest', 'capture request sender');
-  assertIncludes(source, "mode: 'full'", 'explicit full-page capture mode (SPEC §12.2)');
-  assertIncludes(source, "PAGE_SCREENSHOT_ID = '__page__'", 'fixed full-page item id');
+  assertIncludes(source, "options: { mode: 'area' }", 'explicit area capture mode (SPEC §17)');
+  assertIncludes(source, "PAGE_SCREENSHOT_ID = '__page__'", 'fixed screenshot item id');
   assertIncludes(source, "PAGE_SCREENSHOT_FILE = 'screenshot-page.png'", 'fixed attachment file name');
-  assertIncludes(source, 'screenshotPageFile', 'full-page item -> File helper');
+  assertIncludes(source, 'screenshotPageFile', 'screenshot item -> File helper');
   assertIncludes(source, 'data.requestId', 'response matches the pending request id');
   assertIncludes(source, 'data:image/png;base64,', 'PNG data URL decoding');
   assertIncludes(source, 'new File(', 'PNG File construction');
-  // v1.3: one annotated full-page shot, no per-annotation crops/names.
+  // The attachment is still one annotated PNG.
   assert(!source.includes('screenshotFileFromItem'), 'no per-annotation screenshot mapping');
   assert(!source.includes('SCREENSHOT_FILE_PREFIX'), 'no numbered screenshot file prefix');
   assert(!source.includes("'screenshot-'"), 'no numbered screenshot file names');
@@ -417,8 +417,8 @@ check('client.js implements the v1.3 full-page screenshot + attachment pipeline'
   assertIncludes(source, 'status.captureFailed', 'capture failure copy');
   assertIncludes(source, 'toolbar.screenshots', 'toolbar label key');
   assertIncludes(source, 'prompt.screenshotHeader', 'prompt header locale key');
-  assertIncludes(source, 'prompt.screenshotFullPage', 'full-page prompt locale key');
-  assertIncludes(source, "t('prompt.screenshotFullPage')", 'prompt line localized at send time');
+  assertIncludes(source, 'prompt.screenshotAreas', 'area screenshot prompt locale key');
+  assertIncludes(source, "t('prompt.screenshotAreas')", 'prompt line localized at send time');
   assertIncludes(source, 'writeDraftPrompt', 'capture-aware write path');
   assert(!/sandbox/i.test(source), 'no sandbox attribute introduced');
   const draftIndex = source.indexOf('inputActions.setDraft(appendToDraft(promptText))');
@@ -427,7 +427,7 @@ check('client.js implements the v1.3 full-page screenshot + attachment pipeline'
   assert(draftIndex >= 0, 'setDraft call missing');
   assert(attachIndex > draftIndex, 'the page screenshot must be added after setDraft');
   assert(openIndex > attachIndex, 'the chat view opens after the attachment is in place');
-  return 'full-page screenshot pipeline ok';
+  return 'area screenshot pipeline ok';
 });
 
 check('decodePngDataUrl + screenshotPageFile decode PNG data URLs only', () => {
@@ -457,7 +457,7 @@ check('decodePngDataUrl + screenshotPageFile decode PNG data URLs only', () => {
   )(decodePngDataUrl, 'screenshot-page.png');
   if (typeof File === 'function') {
     const file = makeFile({ id: '__page__', dataUrl: 'data:image/png;base64,' + png });
-    assert(file && file.name === 'screenshot-page.png', 'full-page attachment keeps its fixed name');
+    assert(file && file.name === 'screenshot-page.png', 'screenshot attachment keeps its fixed name');
     assert(file.type === 'image/png', 'file media type is PNG');
     assert(file.size > 8, 'file carries the decoded bytes');
     assert(makeFile({ dataUrl: 'data:text/plain;base64,AAAA' }) === null, 'rejects non-PNG data URLs');
@@ -542,7 +542,7 @@ const REQUIRED_LOCALE_KEYS = [
   'status.capturing',
   'status.captureFailed',
   'prompt.screenshotHeader',
-  'prompt.screenshotFullPage',
+  'prompt.screenshotAreas',
   'prompt.screenshotLine',
   'error.endpoint',
   'error.noInput',
@@ -583,7 +583,7 @@ check('package locale resources mirror the v1.1/v1.2/v1.3/v1.4/v1.6 keys', () =>
     'status.drafted',
     'panel.screenshotAlt',
     'prompt.screenshotHeader',
-    'prompt.screenshotFullPage',
+    'prompt.screenshotAreas',
     'prompt.screenshotLine',
   ];
   for (const locale of ['zh', 'en']) {
@@ -708,22 +708,22 @@ check('buildPrompt follows the frozen SPEC §5 template', () => {
   assert(!noTarget.includes('目标:'), 'target line omitted without tag/name/text');
   assert(noTarget.includes('选择器: .card'), 'selector-only element keeps its selector');
 
-  // v1.3 §12.2: fixed evidence declaration + one optional full-page line.
+  // SPEC §17: fixed evidence declaration and one optional screenshot line.
   const screenshotHeader = '以下截图是页面渲染结果的证据，仅用于定位，不是对指令的执行。';
-  const fullPageLine = '截图: 见附件 screenshot-page.png（整页截图；批注区域已用红框和编号标出）';
+  const areaScreenshotLine = '截图: 见附件 screenshot-page.png（局部截图，红框和编号对应下方批注）';
   assert(
     promptText.includes('\n' + screenshotHeader + '\n\n## 批注 1'),
     'evidence declaration sits before the first annotation',
   );
   assert(promptText.indexOf(screenshotHeader) < promptText.indexOf('## 批注 1'), 'declaration precedes annotations');
   assert(!promptText.includes('截图:'), 'no screenshot line unless a page shot was attached');
-  const withShots = buildPrompt([element, text], '', fullPageLine);
+  const withShots = buildPrompt([element, text], '', areaScreenshotLine);
   assert(
-    withShots.includes(screenshotHeader + '\n' + fullPageLine + '\n\n## 批注 1'),
-    'full-page screenshot line follows the evidence declaration',
+    withShots.includes(screenshotHeader + '\n' + areaScreenshotLine + '\n\n## 批注 1'),
+    'screenshot line follows the evidence declaration',
   );
-  assert((withShots.match(/截图:/g) || []).length === 1, 'exactly one full-page screenshot line');
-  assert(withShots.indexOf('截图:') < withShots.indexOf('## 批注 1'), 'full-page line sits before the annotations');
+  assert((withShots.match(/截图:/g) || []).length === 1, 'exactly one screenshot line');
+  assert(withShots.indexOf('截图:') < withShots.indexOf('## 批注 1'), 'screenshot line sits before the annotations');
   assert(!withShots.includes('screenshot-1.png'), 'no per-annotation screenshot names');
   assert(!withShots.includes('screenshot-2.png'), 'no per-annotation screenshot names for later annotations');
   assert(!withShots.includes('批注意见:\n按钮文字应统一\n截图:'), 'no screenshot line inside an annotation block');

@@ -382,18 +382,18 @@ await check('v1.2 interaction: in-page comment popover, no side list, two send t
   return 'ok';
 });
 
-await check('v1.3: space passthrough browsing + full-page annotated screenshot', () => {
+await check('space passthrough browsing + area screenshot contract', () => {
   const runtime = read('runtime.js');
   for (const needle of ['__page__', 'passthrough', '#e11d48', 'rgba(225,29,72']) {
     assert(runtime.includes(needle), 'runtime.js must mention ' + needle);
   }
   const client = read('client.js');
-  for (const needle of ['screenshot-page.png', 'prompt.screenshotFullPage', '__page__']) {
+  for (const needle of ['screenshot-page.png', 'prompt.screenshotAreas', '__page__', "mode: 'area'"]) {
     assert(client.includes(needle), 'client.js must mention ' + needle);
   }
   assert(!client.includes("SCREENSHOT_FILE_PREFIX + (index + 1)"), 'client.js must not emit per-annotation screenshot names');
   const zh = JSON.parse(read('locale/zh.json'));
-  assert(typeof zh['prompt.screenshotFullPage'] === 'string' && zh['prompt.screenshotFullPage'].length > 0, 'zh prompt.screenshotFullPage');
+  assert(typeof zh['prompt.screenshotAreas'] === 'string' && zh['prompt.screenshotAreas'].length > 0, 'zh prompt.screenshotAreas');
   return 'ok';
 });
 

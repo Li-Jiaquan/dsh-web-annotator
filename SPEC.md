@@ -562,3 +562,12 @@ Lead `test/accept.mjs` 增加：`/vendor/html2canvas.min.js` 200 且长度 > 100
 - runtime 测试：新增 navigate 目标推导用例（meta base），其余套件保持通过。
 - **真实页面验收**：`http://127.0.0.1:4173/` 经插件代理加载后：`app.js` 正常执行（无 CORS 错误、console 无 error），页面交互（如点击导航按钮切换 data-page/显示变化）可用；整页截图仍能渲染。
 - Lead accept：断言 host.js 含 `/site/` 路由、base 注入为 mirror；runtime 含目标 URL 推导；其余不变。
+
+## 17. 局部批注截图
+
+「写入对话框」默认发送 `capture-screenshots`，指定 `options.mode: 'area'`。请求字段、截图响应结构和宿主的 `/vendor`、`/asset` 路由沿用 §10。显式 `full`、`crop` 和未指定模式的旧请求沿用原行为。
+
+- 运行时按批注的页面坐标取图。取图范围四周保留最多 48 CSS px 上下文并钳制到文档范围。相交的取图范围尽量合并，每边上限为 1800 CSS px 或该方向的视口尺寸，取较大值。超大批注截取靠近当前视口的部分。
+- 分散的区域分别渲染，最多保留四块，按页面顺序拼成一张图。超出块数的批注记入 `failed`，文本照常写入。渲染器按区域设置 `x`、`y`、`width`、`height`，并在克隆文档里跳过范围外的子树绘制，以保留原页面布局。范围内跨源图像沿用 `/asset`。
+- 复用 §12.2 的红框、编号、`__page__` 响应 id 和 PNG 大小上限。编号与草稿内的批注序号一致。客户端继续添加一张 `screenshot-page.png`，提示词引用 `prompt.screenshotAreas`。无可用截图或超时按 §13.2 写入文本。
+- 验收覆盖真实宿主代理下的邻近批注合并、滚动后远处批注的像素和标记、跳过无关跨源图，以及旧截图模式。

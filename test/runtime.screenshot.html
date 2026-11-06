@@ -371,6 +371,11 @@
             return;
           }
 
+          if (document.getElementById('area-end')) {
+            await runAreas();
+            return;
+          }
+
           if (window.location.search.indexOf('tall') >= 0) {
             await runTall(root);
             return;
@@ -974,6 +979,59 @@
           pass();
         }
 
+        async function runAreas() {
+          var green = pageRect(document.getElementById('green-box'));
+          var img = pageRect(document.getElementById('cross-img'));
+          var lower = pageRect(document.getElementById('area-end'));
+          window.scrollTo(0, lower.y - 100);
+          var annotations = [lower, green, img].map(function (rect, index) {
+            return { id: 'area-' + index, number: index + 1, kind: 'element', rect: rect };
+          });
+          var sparse = [30, 500, 1000, 2200, 2600].map(function (y, index) {
+            return { id: 'sparse-' + index, number: index + 4, kind: 'region', rect: { x: 680, y: y, width: 20, height: 20 } };
+          });
+          window.postMessage({ channel: 'dsh-web-annotator', type: 'set-annotations', payload: { annotations: annotations.concat(sparse) } }, '*');
+          await wait(40);
+          var scroll = window.scrollY;
+          assert('areas-scrolled', scroll > img.y + img.height, String(scroll));
+          var shot = await capture('req-areas', ['area-0', 'area-1', 'area-2', 'unknown'], { mode: 'area' });
+          assert('areas-received', !!shot && shot.requestId === 'req-areas', 'no matching screenshot response');
+          assert('areas-scroll-preserved', window.scrollY === scroll, String(window.scrollY));
+          assert('areas-invalid-id', shot.failed.length === 1 && shot.failed[0].id === 'unknown', JSON.stringify(shot.failed));
+          var item = shot.items[0];
+          assert('areas-single', shot.items.length === 1 && item.id === '__page__', 'expected a single PNG');
+          var firstTop = Math.max(0, green.y - 48);
+          var firstHeight = img.y + img.height + 48 - firstTop;
+          var lowerOffset = firstHeight + 8;
+          var expectedWidth = Math.max(green.x + green.width + 48, lower.width + 96);
+          set('areas-size', item.width + 'x' + item.height);
+          assert('areas-size-ok', item.width === expectedWidth && item.height === lowerOffset + lower.height + 96, item.width + 'x' + item.height);
+
+          var canvas = await decodeToCanvas(item.dataUrl);
+          assert('areas-decoded', !!canvas, 'cannot decode area PNG');
+          assert('areas-pixels',
+            isClose(pixelAt(canvas, green.x + 100, green.y - firstTop + 60), [0, 200, 80], 24) &&
+            isClose(pixelAt(canvas, img.x + 100, img.y - firstTop + 50), [255, 0, 0], 24) &&
+            isClose(pixelAt(canvas, 48 + 90, lowerOffset + 48 + 30), [40, 120, 240], 24),
+            'unexpected target colors');
+          function badgeAt(x, y) {
+            return countPixels(canvas, x, y, 22, 22, function (r, g, b, a) {
+              return a > 200 && r < 190 && g < 60 && b < 90;
+            }) > 80;
+          }
+          assert('areas-marks',
+            isClose(pixelAt(canvas, green.x, green.y - firstTop + 60), [225, 29, 72], 24) &&
+            isClose(pixelAt(canvas, 48, lowerOffset + 48 + 30), [225, 29, 72], 24) &&
+            badgeAt(green.x, green.y - firstTop) && badgeAt(48, lowerOffset + 48),
+            'missing area outlines or badges');
+          var sparseShot = await capture('req-sparse', sparse.map(function (entry) { return entry.id; }), { mode: 'area' });
+          assert('areas-cap', !!sparseShot && sparseShot.items.length === 1 && sparseShot.failed.length === 1 &&
+            sparseShot.failed[0].id === 'sparse-4' && sparseShot.failed[0].error === 'max-areas',
+            JSON.stringify(sparseShot && sparseShot.failed));
+          assert('no-errors', errors.length === 0, errors.join(' | '));
+          pass();
+        }
+
         async function runNoVendor(root) {
           var green = pageRect(document.getElementById('green-box'));
           window.postMessage(
@@ -985,7 +1043,7 @@
             '*'
           );
           await wait(40);
-          var shot = await capture('req-nv', ['green', 'green-2']);
+          var shot = await capture('req-nv', ['green', 'green-2'], { mode: 'area' });
           assert('novendor-received', !!shot, 'no screenshots message');
           assert('novendor-items-empty', Array.isArray(shot.items) && shot.items.length === 0, 'items=' + (shot.items || []).length);
           var failed = shot.failed || [];

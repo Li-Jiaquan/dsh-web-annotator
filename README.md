@@ -56,7 +56,7 @@
 6. **按住空格临时「穿过」批注层**：批注模式下长按空格，批注层不再拦截鼠标——可以正常点击链接/按钮、输入、滚动页面；页面顶部会显示「松开空格键恢复批注模式」。松开空格回到批注模式（已有批注和评论不丢）。
 7. **点击页面上的编号 marker（小圆点）→ 在它旁边弹出悬浮窗**，直接在里面写评论；「保存」后 marker 变绿表示已评论，再点 marker 可重新编辑/删除。没有右侧批注列表。
 8. 页面底部浮动条：`批注 N 条 · 写入对话框` + `清空`；也可以点工具栏的 **「写入对话框（N）」** 按钮（N 为批注数）。**不会自动发送**——内容写进会话输入框（草稿），你可以继续修改措辞后再自己点发送。如果输入框里已有文字，批注块会追加在原文之后（空行分隔），不覆盖原草稿。
-9. **截图附件（默认开，整页图）**：写入草稿时会渲染**整张页面**，把所有批注区域用**红框 + 编号**标出来，作为一张 `screenshot-page.png` 图片附件加入输入框；提示词里带一行说明。关闭「附带截图」开关则只写结构化文本。
+9. **截图附件（默认开）**：写入草稿时截取批注附近的画面，用红框和编号标注，作为一张 `screenshot-page.png` 加入输入框。关闭「附带截图」则只写结构化文本。
 10. 状态栏只在需要时显示（打开页面/截图/错误/已写入）；「就绪」「批注模式已开启」这类常驻提示已去掉。
 
 > 已知限制（v1.5）：页面内**POST 表单**、`history.pushState`/`location.assign` 这类 JS 路由跳转不会自动走代理（会脱离批注环境）；遇到时可在地址栏重新输入目标 URL。协议自动判断的兜底是：只有输入时自动补的 `https://` 在**网络层连不上**时，宿主才会自动改用 `http://` 重试一次；明确写了 `http://`/`https://` 的地址不会改协议。
@@ -67,14 +67,14 @@
 
 评论的同步方式：marker 悬浮窗「保存」→ runtime 发 `annotation-comment`，客户端镜像保存；「删除」→ `annotation-delete`；页面浮动条「清空」会逐条 `annotation-delete` 保证两端一致。写入草稿成功后清空批注并复位。
 
-截图：一张整页 PNG（`screenshot-page.png`），图上用红框和编号标出每个批注区域，提示词里在固定声明行后带一行 `截图: 见附件 screenshot-page.png（整页截图；批注区域已用红框和编号标出）`，模型能同时看到整页布局、定位区域与结构化证据。截图通过 NEXT 的 `conversation.createDrafts` 本地图片 draft + `inputActions.addAttachments` 加入输入框（不经过网络上传）。任何一步不可用时自动降级为纯文本批注，写入草稿不会失败。
+截图是一张 `screenshot-page.png`，图里的编号对应提示词中的批注。截图通过 NEXT 的 `conversation.createDrafts` 本地图片 draft + `inputActions.addAttachments` 加入输入框。截图失败或超时会继续写入文字批注。
 
-## 截图是如何生成的（v1.3）
+## 截图是如何生成的
 
-- 运行时在代理页面内按需懒加载内置的 `vendor/html2canvas.min.js`（1.4.1，MIT），对**整页**做一次 canvas 渲染；然后在 canvas 副本上为每个批注绘制 3px 红框（`#e11d48`）+ 半透明红色填充 + 左上角深红底白字编号徽标（编号与提示词「批注 N」一致），导出为一张整页 PNG（长边 ≤2400px、≤3MB，超限等比降采样）。
+- 运行时按需加载内置的 `html2canvas`（1.4.1，MIT），直接渲染批注附近的区域。邻近批注尽量合并，远处分块按页面顺序拼接，最多四块。每条批注的文字都会写入草稿。合成图加红框和编号后导出 PNG，长边 ≤2400px、体积 ≤3MB。
 - 加载器对真实站点做了兼容：html2canvas 是 UMD 包，**遇到定义了 AMD loader 的页面（如 baidu.com，`window.define.amd === true`）会注册成 AMD 模块而不设置 `window.html2canvas`**；因此运行时优先用 `fetch(绝对 /vendor URL)` + `new Function(...)`（把 `define/module/exports/require` 影子为 `undefined`，强制走浏览器全局分支），失败再回退 classic `<script>`。同时避免 `<base href="target">` 把相对 `/vendor/...` 解析到目标站。
 - 跨源图片通过宿主新增的 `GET /asset?url=` 同源代理取回（`html2canvas` 的 `proxy` 选项），因此截图不会因跨源图片而空白/失败；图片等待上限 4s，过慢的图片会被跳过（截图仍成功）。
-- 裁剪小图模式（`mode:'crop'`）作为内部兼容能力保留，产品默认只用 `full`。
+- 产品请求 `mode:'area'`。`mode:'full'` 和 `mode:'crop'` 供旧调用方使用。
 
 ## 性能优化（v1.7）
 
@@ -121,18 +121,19 @@ v1.7 做了一轮性能优化，全部可复现（`node test/bench.capture.mjs`�
 ```
 node --check index.js client.js runtime.js
 node test/host.test.mjs          # 13/13 宿主代理、/site 同源镜像、endpoint、/vendor、/asset（含缓存/ETag）、协议回退
-node test/client.static.mjs      # 23/23 客户端外壳/槽注册/协议/模板/草稿写入/整页截图/地址栏/导航/浏览器历史/渲染性能
+node test/client.static.mjs      # 23/23 客户端外壳/槽注册/协议/模板/草稿写入/截图/地址栏/导航/浏览器历史/渲染性能
 node test/runtime-check.mjs      # 73/73 运行时契约 + headless Chrome 端到端手势
-node test/runtime.screenshot.mjs # 112/112 整页标注截图 + 链接 navigate/ready-url + 镜像 base 目标 URL 推导
+node test/runtime.screenshot.mjs # 局部与旧版截图模式、navigate/ready-url、镜像 base 目标 URL 推导
 node test/runtime.comments.mjs   # 93/93 空格穿透 + 悬浮评论窗/写入对话框浮动条/清空同步
 node test/accept.mjs             # 23/23 Lead 验收：清单/图标/语法/协议一致性/宿主集成/路由/契约/镜像
 
 # 性能基准（无需网络）
-node test/bench.capture.mjs      # 长页截图捕获：capture/render 耗时、渲染像素、canvas 内存
+node test/bench.capture.mjs --mode full --annotations 3
+node test/bench.capture.mjs --mode area --annotations 3
 node test/bench.host.mjs         # 宿主：/asset 缓存命中、/runtime.js 读取、/proxy 吞吐
 ```
 
-接口契约见 `SPEC.md`（冻结）：§0-§9 为 v1.0 基础协议，§10 为 v1.1 截图附件，§11 为 v1.2 页面内悬浮评论窗交互，§12 为 v1.3 空格穿透 + 整页标注截图，§13 为 v1.4 状态栏精简 + 写入对话框，§14 为 v1.5 地址栏自动协议 + 链接跳转，§15 为 v1.6 浏览器式 后退/前进/刷新，§16 为 v1.8 同源镜像代理（ES module 页面兼容）。
+接口契约见 `SPEC.md`。§0–§9 记录基础协议，§10–§13 记录截图、评论窗、空格穿透和写入草稿，§14–§16 记录地址栏、导航和同源镜像。§17 记录当前的局部截图行为。
 
 ## License
 

@@ -34,6 +34,7 @@ import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
+import { createAnnotatorServer } from '../index.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const RUNTIME_PATH = path.resolve(HERE, '..', 'runtime.js');
@@ -231,6 +232,19 @@ async function startHostLikeServer(originB) {
             '<div style="height:2600px"></div>\n    <script src="/runtime.js"></script>',
           );
         }
+        if (requestUrl.searchParams.get('areas') === '1') {
+          // The real proxy injects the runtime. Keep an unrelated image well
+          // between the selected regions and use a shifted x on the lower one.
+          html = html.replace(
+            '<script src="/runtime.js"></script>',
+            `<div style="height:1300px"></div>
+             <div style="height:60px;background-image:url(${originB}/img.png?outside-background)"></div>
+             <img src="${originB}/img.png?outside-image" width="200" height="100" />
+             <div style="height:1300px"></div>
+             <div id="area-end" style="margin-left:360px;width:180px;height:60px;background:rgb(40,120,240)"></div>
+             <div style="height:500px"></div>`,
+          );
+        }
         if (requestUrl.searchParams.get('mirrorbase') === '1') {
           // v1.8: simulate the same-origin mirror document: a /site/ <base>
           // (so anchor.href would be a mirror URL) + the real target URL meta.
@@ -344,10 +358,10 @@ const staticChecks = [
   ['requestId echoed', source.includes('requestId: requestId')],
   ['items/failed response shape', source.includes('items: Array.isArray(items)') && source.includes('failed: Array.isArray(failed)')],
   ['lazy-load cached promise', source.includes('h2cPromise')],
-  ['single whole-page render call', source.includes('html2canvasFn(docEl')],
+  ['legacy modes render one whole-page canvas', source.includes('renderScreenshot(html2canvasFn, docEl, pageWidth, pageHeight, renderScale)')],
   ['useCORS false + allowTaint false', source.includes('useCORS: false') && source.includes('allowTaint: false')],
   ['backgroundColor null', source.includes('backgroundColor: null')],
-  ['full-page width/height + scroll 0', source.includes('width: pageWidth') && source.includes('scrollX: 0')],
+  ['area render uses offsets and legacy render uses scroll 0', source.includes('x: area ? area.left : 0') && source.includes('scrollX: area ? scrollLeft() : 0')],
   ['crop padding 12px', source.includes('SHOT_PADDING = 12')],
   ['max side 1400', source.includes('SHOT_MAX_SIDE = 1400')],
   ['max 12 images', source.includes('SHOT_MAX_ITEMS = 12')],
@@ -357,7 +371,7 @@ const staticChecks = [
   ['overlay excluded from the render', source.includes('ignoreElements')],
   ['load failure handled (no throw)', source.includes('html2canvas-load-failed')],
   ['unknown id / empty rect failures', source.includes('unknown-id') && source.includes('empty-rect')],
-  ['v1.3 full mode is the product default', source.includes("options.mode === 'crop' ? 'crop' : 'full'")],
+  ['area mode is supported with full as the legacy fallback', source.includes("options.mode === 'area' || options.mode === 'crop' ? options.mode : 'full'")],
   ['full page uses the fixed id __page__', source.includes("'__page__'")],
   ['full page border colour #e11d48', source.includes("'#e11d48'")],
   ['full page translucent fill', source.includes("'rgba(225,29,72,0.08)'")],
@@ -565,6 +579,29 @@ try {
   console.log(`    tall page size:   ${attrOf(htmlTall, 'data-test-tall-page-size')}`);
   console.log(`    tall full size:   ${attrOf(htmlTall, 'data-test-tall-size')}`);
   console.log(`    tall full bytes:  ${attrOf(htmlTall, 'data-test-tall-bytes')}`);
+
+  // Exercise the same runtime and asset routes used by the app.
+  const assetUrls = [];
+  const proxy = createAnnotatorServer({ fetchImpl(url, options) {
+    const target = new URL(url);
+    if (target.origin === cross.origin && target.pathname === '/img.png') assetUrls.push(target);
+    return fetch(url, options);
+  } });
+  try {
+    const { origin } = await proxy.start();
+    const target = encodeURIComponent(`${host.origin}/page?areas=1`);
+    const { stdout: html } = await runHeadless(browser, `${origin}/proxy?url=${target}`, 30000);
+    check('area capture: harness status is pass', attrOf(html, 'data-test-status') === 'pass', attrOf(html, 'data-test-failed-step') || 'missing');
+    check('area capture: two distant areas with nearby annotations merged into one PNG', attrOf(html, 'data-test-areas-size-ok') === '1');
+    check('area capture: correct pixels from both areas while scrolled', attrOf(html, 'data-test-areas-pixels') === '1');
+    check('area capture: red outlines and numbered badges on both areas', attrOf(html, 'data-test-areas-marks') === '1');
+    check('area capture: excess regions fail independently of the PNG', attrOf(html, 'data-test-areas-cap') === '1');
+    check('area capture: in-range image uses the host asset proxy', assetUrls.some((url) => url.search === ''));
+    check('area capture: out-of-range images skip the host asset proxy', assetUrls.every((url) => url.search === ''));
+    console.log(`    area image:       ${attrOf(html, 'data-test-areas-size')}`);
+  } finally {
+    await proxy.close();
+  }
 
   /* ---- run 1c: v1.5 ready.url prefers the host-injected meta ---- */
   const runMeta = await runHeadless(browser, `${host.origin}/page?meta=1`, 30000);

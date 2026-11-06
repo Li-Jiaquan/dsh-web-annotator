@@ -2317,10 +2317,8 @@
    * Parent -> page: { channel, type:'capture-screenshots', requestId, ids, options? }
    * Page -> parent: { channel, type:'screenshots', requestId, items, failed }
    *
-   * html2canvas is lazy-loaded once (cached promise), the whole page is
-   * rendered once per request, then every registered annotation rect is
-   * cropped out of that single render. All failures are reported per id; this
-   * section never lets an exception escape into the page.
+   * The client requests bounded areas around annotations (SPEC §17).
+   * Older callers can still request the original full-page or crop modes.
    * ================================================================== */
 
   var H2C_VENDOR_PATH = '/vendor/html2canvas.min.js';
@@ -2333,7 +2331,13 @@
   var SHOT_MAX_RENDER_PIXELS = 24000000;
   var SHOT_MAX_IDS = 1000;
 
-  /* v1.3 SPEC §12.2: full-page annotated screenshot (product default mode). */
+  var AREA_CONTEXT = 48;
+  var AREA_MAX_EDGE = 1800;
+  var AREA_MAX_REGIONS = 4;
+  var AREA_GAP = 8;
+  var EMPTY_GIF = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+
+  /* Shared annotated PNG budget and styling (SPEC §12.2 / §17). */
   var FULL_MAX_LONG_EDGE = 2400;
   var FULL_MIN_LONG_EDGE = 800;
   var FULL_MAX_BYTES = 3 * 1024 * 1024;
@@ -2535,7 +2539,7 @@
     enqueueCapture(requestId, ids, options);
   }
 
-  /** Serialize capture requests: one whole-page render at a time. */
+  /** Serialize capture requests so batches cannot compete with one another. */
   function enqueueCapture(requestId, ids, options) {
     captureChain = captureChain
       .then(function () {
@@ -2553,8 +2557,7 @@
     var failed = [];
     var plan = [];
     var accepted = 0;
-    // v1.3: `full` is the product default; `crop` stays as a compatible path.
-    var mode = options.mode === 'crop' ? 'crop' : 'full';
+    var mode = options.mode === 'area' || options.mode === 'crop' ? options.mode : 'full';
 
     for (var i = 0; i < ids.length; i += 1) {
       var id = ids[i];
@@ -2602,10 +2605,22 @@
     var docEl = document.documentElement;
     var pageWidth = Math.max(1, Math.ceil(docEl.scrollWidth || 0));
     var pageHeight = Math.max(1, Math.ceil(docEl.scrollHeight || 0));
-    var captureStartedAt = Date.now();
     var renderScale = captureNumber(options.scale, 1);
     if (!(renderScale > 0)) renderScale = 1;
     renderScale = clamp(renderScale, 0.1, 2);
+    if (mode === 'area') {
+      var areas = planScreenshotAreas(plan, failed, pageWidth, pageHeight);
+      var areaImage = areas.length > 0
+        ? await captureScreenshotAreas(html2canvasFn, docEl, areas, failed, renderScale)
+        : null;
+      if (areaImage) {
+        items.push({ id: '__page__', dataUrl: areaImage.dataUrl, width: areaImage.width, height: areaImage.height });
+      }
+      postScreenshots(requestId, items, failed);
+      return;
+    }
+
+    var captureStartedAt = Date.now();
     // v1.7: full mode renders directly at the final long-edge budget instead of
     // rendering huge pages at 1x and downsampling afterwards. Output size is
     // unchanged (still <= FULL_MAX_LONG_EDGE), render pixels drop sharply.
@@ -2623,25 +2638,7 @@
 
     var canvas = null;
     try {
-      canvas = await html2canvasFn(docEl, {
-        backgroundColor: null,
-        scale: renderScale,
-        useCORS: false,
-        allowTaint: false,
-        logging: false,
-        proxy: window.location.origin + H2C_ASSET_PROXY,
-        width: pageWidth,
-        height: pageHeight,
-        windowWidth: window.innerWidth || pageWidth,
-        windowHeight: window.innerHeight || pageHeight,
-        scrollX: 0,
-        scrollY: 0,
-        imageTimeout: 4000,
-        ignoreElements: function (element) {
-          // Never bake the annotation overlay itself into a screenshot.
-          return !!(element && element.id === ROOT_ID);
-        }
-      });
+      canvas = await renderScreenshot(html2canvasFn, docEl, pageWidth, pageHeight, renderScale);
     } catch (error) {
       // eslint-disable-next-line no-console -- temporary acceptance diagnostics
       console.error('[dsh-web-annotator] capture render failed', {
@@ -2670,7 +2667,7 @@
     var scaleY = canvasHeight / pageHeight;
 
     if (mode === 'full') {
-      var fullImage = buildFullPageImage(canvas, plan, scaleX, scaleY);
+      var fullImage = buildAnnotatedImage(canvas, plan, scaleX, scaleY);
       releaseCanvas(canvas);
       if (!fullImage || fullImage.error) {
         for (var fp = 0; fp < plan.length; fp += 1) {
@@ -2718,78 +2715,250 @@
   }
 
   /* ------------------------------------------------------------------ *
-   * v1.3 full-page annotated screenshot (SPEC §12.2)
+   * Bounded annotation screenshots (SPEC §17)
    * ------------------------------------------------------------------ */
 
-  /**
-   * Draw every valid annotation directly onto the whole-page render and return
-   * one PNG (long edge <= 2400px, <= 3MB, fixed id `__page__`).
-   *
-   * v1.7: no intermediate source-sized canvas copy — the render canvas itself is
-   * annotated in place, then downsampled/encoded from it. Callers release the
-   * render canvas as soon as this returns, halving peak canvas memory.
-   */
-  function buildFullPageImage(sourceCanvas, plan, scaleX, scaleY) {
-    try {
-      var sourceWidth = sourceCanvas.width;
-      var sourceHeight = sourceCanvas.height;
-      if (!sourceWidth || !sourceHeight) return { error: 'render-failed' };
-      var longEdge = Math.max(sourceWidth, sourceHeight);
-      var outScale = longEdge > FULL_MAX_LONG_EDGE ? FULL_MAX_LONG_EDGE / longEdge : 1;
+  function renderScreenshot(render, docEl, width, height, scale, area) {
+    return render(docEl, {
+      backgroundColor: null,
+      scale: scale,
+      useCORS: false,
+      allowTaint: false,
+      logging: false,
+      proxy: window.location.origin + H2C_ASSET_PROXY,
+      x: area ? area.left : 0,
+      y: area ? area.top : 0,
+      width: width,
+      height: height,
+      windowWidth: viewportWidth() || width,
+      windowHeight: viewportHeight() || height,
+      scrollX: area ? scrollLeft() : 0,
+      scrollY: area ? scrollTop() : 0,
+      imageTimeout: 4000,
+      onclone: area ? function (clone) { hideOutsideScreenshot(clone, area); } : undefined,
+      ignoreElements: function (element) {
+        return !!(element && element.id === ROOT_ID);
+      }
+    });
+  }
 
-      var ctx = sourceCanvas.getContext('2d');
-      if (!ctx) return { error: 'canvas-unavailable' };
-      // html2canvas leaves its own render scale on the canvas context; reset it
-      // so our annotation coordinates are plain canvas pixels (v1.7 draws on
-      // the render canvas directly, so this is required for correct geometry).
+  function planScreenshotAreas(plan, failed, pageWidth, pageHeight) {
+    var maxWidth = Math.max(AREA_MAX_EDGE, viewportWidth());
+    var maxHeight = Math.max(AREA_MAX_EDGE, viewportHeight());
+    var scrollX = scrollLeft();
+    var scrollY = scrollTop();
+    var areas = [];
+    for (var i = 0; i < plan.length; i += 1) {
+      var entry = plan[i];
+      var rect = entry.rect;
+      var left = Math.max(0, rect.x);
+      var top = Math.max(0, rect.y);
+      var right = Math.min(pageWidth, rect.x + rect.width);
+      var bottom = Math.min(pageHeight, rect.y + rect.height);
+      if (right - left < 1 || bottom - top < 1) {
+        failed.push({ id: entry.id, error: 'empty-rect' });
+        continue;
+      }
+
+      // For a very large target (such as <main>), keep the portion nearest
+      // the current viewport. Small and offscreen targets use their page rects.
+      left = Math.floor(Math.max(0, left - AREA_CONTEXT));
+      top = Math.floor(Math.max(0, top - AREA_CONTEXT));
+      right = Math.ceil(Math.min(pageWidth, right + AREA_CONTEXT));
+      bottom = Math.ceil(Math.min(pageHeight, bottom + AREA_CONTEXT));
+      if (right - left > maxWidth) {
+        left = clamp(scrollX, left, right - maxWidth);
+        right = left + maxWidth;
+      }
+      if (bottom - top > maxHeight) {
+        top = clamp(scrollY, top, bottom - maxHeight);
+        bottom = top + maxHeight;
+      }
+
+      var area = areas.find(function (candidate) {
+        return left <= candidate.right && right >= candidate.left &&
+          top <= candidate.bottom && bottom >= candidate.top &&
+          Math.max(right, candidate.right) - Math.min(left, candidate.left) <= maxWidth &&
+          Math.max(bottom, candidate.bottom) - Math.min(top, candidate.top) <= maxHeight;
+      });
+      if (area) {
+        area.left = Math.min(area.left, left);
+        area.top = Math.min(area.top, top);
+        area.right = Math.max(area.right, right);
+        area.bottom = Math.max(area.bottom, bottom);
+        area.entries.push(entry);
+      } else if (areas.length < AREA_MAX_REGIONS) {
+        areas.push({ left: left, top: top, right: right, bottom: bottom, entries: [entry] });
+      } else {
+        failed.push({ id: entry.id, error: 'max-areas' });
+      }
+    }
+    return areas.sort(function (a, b) { return a.top - b.top || a.left - b.left; });
+  }
+
+  /** Stop html2canvas painting unrelated subtrees without changing their layout. */
+  function hideOutsideScreenshot(clone, area) {
+    var view = clone.defaultView;
+    var left = area.left - view.scrollX - AREA_CONTEXT;
+    var top = area.top - view.scrollY - AREA_CONTEXT;
+    var right = area.right - view.scrollX + AREA_CONTEXT;
+    var bottom = area.bottom - view.scrollY + AREA_CONTEXT;
+    var nodes = clone.body.querySelectorAll('*');
+    var kept = new Set([clone.body]);
+    var outside = [];
+    for (var i = nodes.length - 1; i >= 0; i -= 1) {
+      var node = nodes[i];
+      // Keep ancestors of intersecting nodes, including descendants that
+      // overflow their parent or are positioned independently of it.
+      if (kept.has(node)) {
+        kept.add(node.parentElement);
+        continue;
+      }
+      var bounds = node.getBoundingClientRect();
+      if (bounds.right > left && bounds.left < right && bounds.bottom > top && bounds.top < bottom) {
+        kept.add(node);
+        kept.add(node.parentElement);
+      } else if (node.style) {
+        outside.push(node);
+      }
+    }
+    for (var j = 0; j < outside.length; j += 1) {
+      var element = outside[j];
+      if (!kept.has(element.parentElement)) continue;
+      element.style.setProperty('opacity', '0', 'important');
+      // The renderer reads a subtree root's image sources before checking its
+      // opacity. Leave the cloned image's actual attributes and layout alone.
+      element.style.setProperty('background-image', 'none', 'important');
+      if (element.tagName === 'IMG') {
+        Object.defineProperty(element, 'currentSrc', { value: EMPTY_GIF });
+      }
+    }
+  }
+
+  async function captureScreenshotAreas(render, docEl, areas, failed, requestedScale) {
+    var totalHeight = AREA_GAP * (areas.length - 1);
+    var maxWidth = 0;
+    for (var i = 0; i < areas.length; i += 1) {
+      maxWidth = Math.max(maxWidth, areas[i].right - areas[i].left);
+      totalHeight += areas[i].bottom - areas[i].top;
+    }
+    var scale = Math.min(1, requestedScale, FULL_MAX_LONG_EDGE / Math.max(maxWidth, totalHeight));
+    var panels = await Promise.all(areas.map(async function (area) {
+      var width = area.right - area.left;
+      var height = area.bottom - area.top;
+      var canvas = null;
       try {
-        if (typeof ctx.setTransform === 'function') ctx.setTransform(1, 0, 0, 1, 0, 0);
-        ctx.globalAlpha = 1;
-        ctx.globalCompositeOperation = 'source-over';
+        canvas = await renderScreenshot(render, docEl, width, height, scale, area);
+        if (canvas && canvas.width && canvas.height &&
+            drawScreenshotMarks(canvas, area.entries, canvas.width / width, canvas.height / height, area)) {
+          return { area: area, canvas: canvas };
+        }
       } catch (error) {
-        /* ignore */
+        /* Other areas can still be attached. */
       }
+      releaseCanvas(canvas);
+      for (var entry of area.entries) failed.push({ id: entry.id, error: 'render-failed' });
+      return null;
+    }));
+    panels = panels.filter(Boolean);
+    if (panels.length === 0) return null;
 
-      // Keep the final (post-downscale) stroke/badge sizes exact.
-      var strokeWidth = FULL_BORDER_WIDTH / outScale;
-      var badgeSize = FULL_BADGE_SIZE / outScale;
-      var badgeFont = Math.max(8 / outScale, badgeSize * 0.55);
-
-      for (var i = 0; i < plan.length; i += 1) {
-        var entry = plan[i];
-        var x = entry.rect.x * scaleX;
-        var y = entry.rect.y * scaleY;
-        var w = entry.rect.width * scaleX;
-        var h = entry.rect.height * scaleY;
-        if (!(w >= 0.5) || !(h >= 0.5)) continue;
-        ctx.fillStyle = FULL_FILL_COLOR;
-        ctx.fillRect(x, y, w, h);
-        ctx.strokeStyle = FULL_STROKE_COLOR;
-        ctx.lineWidth = strokeWidth;
-        ctx.strokeRect(x, y, w, h);
-        drawFullBadge(ctx, x, y, badgeSize, badgeFont, entry.number, sourceWidth, sourceHeight);
+    var output = panels[0].canvas;
+    try {
+      if (panels.length > 1) {
+        var gap = Math.floor(AREA_GAP * scale);
+        output = document.createElement('canvas');
+        output.width = Math.max.apply(null, panels.map(function (panel) { return panel.canvas.width; }));
+        output.height = panels.reduce(function (sum, panel) { return sum + panel.canvas.height; }, gap * (panels.length - 1));
+        var context = output.getContext('2d');
+        if (!context) throw new Error('canvas-unavailable');
+        context.fillStyle = '#e5e7eb';
+        context.fillRect(0, 0, output.width, output.height);
+        var offset = 0;
+        for (var panel of panels) {
+          context.drawImage(panel.canvas, 0, offset);
+          offset += panel.canvas.height + gap;
+        }
       }
-
-      var outWidth = Math.max(1, Math.round(sourceWidth * outScale));
-      var outHeight = Math.max(1, Math.round(sourceHeight * outScale));
-      var encoded = encodeFull(sourceCanvas, outWidth, outHeight);
-      if (!encoded || encoded.error) return encoded || { error: 'encode-failed' };
-
-      var guard = 0;
-      while (encoded.bytes > FULL_MAX_BYTES && guard < 12) {
-        guard += 1;
-        var nextWidth = Math.floor(encoded.width * FULL_DOWNSCALE_STEP);
-        var nextHeight = Math.floor(encoded.height * FULL_DOWNSCALE_STEP);
-        if (Math.max(nextWidth, nextHeight) < FULL_MIN_LONG_EDGE) break;
-        var retry = encodeFull(sourceCanvas, nextWidth, nextHeight);
-        if (!retry || retry.error) break;
-        encoded = retry;
+      var image = encodeAnnotatedPng(output);
+      if (!image.error) return image;
+      for (var panel of panels) {
+        for (var entry of panel.area.entries) failed.push({ id: entry.id, error: image.error });
       }
-      if (encoded.bytes > FULL_MAX_BYTES) return { error: 'full-image-too-large' };
-      return encoded;
+      return null;
+    } finally {
+      if (panels.length > 1) releaseCanvas(output);
+      for (var panel of panels) releaseCanvas(panel.canvas);
+    }
+  }
+
+  /** Annotate the render in place, with each badge constrained to its panel. */
+  function drawScreenshotMarks(sourceCanvas, plan, scaleX, scaleY, area) {
+    var ctx = sourceCanvas.getContext('2d');
+    if (!ctx) return false;
+    // html2canvas leaves the render transform on the returned context.
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
+    var sourceWidth = sourceCanvas.width;
+    var sourceHeight = sourceCanvas.height;
+    var outScale = Math.min(1, FULL_MAX_LONG_EDGE / Math.max(sourceWidth, sourceHeight));
+    var strokeWidth = FULL_BORDER_WIDTH / outScale;
+    var badgeSize = FULL_BADGE_SIZE / outScale;
+    var badgeFont = badgeSize * 0.55;
+    var originX = area ? area.left : 0;
+    var originY = area ? area.top : 0;
+
+    for (var i = 0; i < plan.length; i += 1) {
+      var entry = plan[i];
+      var x = (entry.rect.x - originX) * scaleX;
+      var y = (entry.rect.y - originY) * scaleY;
+      var w = entry.rect.width * scaleX;
+      var h = entry.rect.height * scaleY;
+      if (area) {
+        w = Math.min(sourceWidth, x + w) - Math.max(0, x);
+        h = Math.min(sourceHeight, y + h) - Math.max(0, y);
+        x = Math.max(0, x);
+        y = Math.max(0, y);
+      }
+      if (!(w >= 0.5) || !(h >= 0.5)) continue;
+      ctx.fillStyle = FULL_FILL_COLOR;
+      ctx.fillRect(x, y, w, h);
+      ctx.strokeStyle = FULL_STROKE_COLOR;
+      ctx.lineWidth = strokeWidth;
+      ctx.strokeRect(x, y, w, h);
+      drawFullBadge(ctx, x, y, badgeSize, badgeFont, entry.number, sourceWidth, sourceHeight);
+    }
+    return true;
+  }
+
+  function buildAnnotatedImage(sourceCanvas, plan, scaleX, scaleY) {
+    try {
+      if (!drawScreenshotMarks(sourceCanvas, plan, scaleX, scaleY)) return { error: 'canvas-unavailable' };
+      return encodeAnnotatedPng(sourceCanvas);
     } catch (error) {
       return { error: 'full-render-failed' };
     }
+  }
+
+  function encodeAnnotatedPng(sourceCanvas) {
+    var outScale = Math.min(1, FULL_MAX_LONG_EDGE / Math.max(sourceCanvas.width, sourceCanvas.height));
+    var outWidth = Math.max(1, Math.round(sourceCanvas.width * outScale));
+    var outHeight = Math.max(1, Math.round(sourceCanvas.height * outScale));
+    var encoded = encodeFull(sourceCanvas, outWidth, outHeight);
+    if (encoded.error) return encoded;
+
+    var guard = 0;
+    while (encoded.bytes > FULL_MAX_BYTES && guard < 12) {
+      guard += 1;
+      var nextWidth = Math.floor(encoded.width * FULL_DOWNSCALE_STEP);
+      var nextHeight = Math.floor(encoded.height * FULL_DOWNSCALE_STEP);
+      if (Math.max(nextWidth, nextHeight) < FULL_MIN_LONG_EDGE) break;
+      var retry = encodeFull(sourceCanvas, nextWidth, nextHeight);
+      if (retry.error) break;
+      encoded = retry;
+    }
+    return encoded.bytes > FULL_MAX_BYTES ? { error: 'full-image-too-large' } : encoded;
   }
 
   /** Dark-red rounded badge with the annotation number, top-left of the rect. */
@@ -2818,30 +2987,15 @@
   }
 
   function encodeFull(sourceCanvas, width, height) {
-    var output = null;
+    if (sourceCanvas.width !== width || sourceCanvas.height !== height) {
+      return encodeCrop(sourceCanvas, 0, 0, sourceCanvas.width, sourceCanvas.height, width, height);
+    }
     try {
-      output = document.createElement('canvas');
-      output.width = width;
-      output.height = height;
-      var ctx = output.getContext('2d');
-      if (!ctx) return { error: 'canvas-unavailable' };
-      ctx.imageSmoothingEnabled = true;
-      if ('imageSmoothingQuality' in ctx) ctx.imageSmoothingQuality = 'high';
-      ctx.drawImage(sourceCanvas, 0, 0, sourceCanvas.width, sourceCanvas.height, 0, 0, width, height);
-      var dataUrl = output.toDataURL('image/png');
+      var dataUrl = sourceCanvas.toDataURL('image/png');
       if (typeof dataUrl !== 'string' || dataUrl.indexOf('data:image/png') !== 0) return { error: 'encode-failed' };
       return { dataUrl: dataUrl, width: width, height: height, bytes: dataUrlBytes(dataUrl) };
     } catch (error) {
       return { error: 'encode-failed' };
-    } finally {
-      if (output) {
-        try {
-          output.width = 0;
-          output.height = 0;
-        } catch (error) {
-          /* ignore */
-        }
-      }
     }
   }
 

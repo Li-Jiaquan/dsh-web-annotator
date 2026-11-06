@@ -74,6 +74,9 @@
         'use strict';
 
         var htmlEl = document.documentElement;
+        var params = new URLSearchParams(window.location.search);
+        var mode = params.get('mode') === 'area' ? 'area' : 'full';
+        var annotationCount = Number(params.get('annotations')) || 12;
         var bench = {
           canvases: [],
           captures: [],
@@ -170,7 +173,7 @@
                 type: 'capture-screenshots',
                 requestId: requestId,
                 ids: ids,
-                options: { mode: 'full' }
+                options: { mode: mode }
               },
               '*'
             );
@@ -222,7 +225,7 @@
 
             var annotations = [];
             var ids = [];
-            for (var index = 1; index <= 12; index += 1) {
+            for (var index = 1; index <= annotationCount; index += 1) {
               var element = document.getElementById(index % 2 === 0 ? 'img' + index : 'box' + index);
               var rect = pageRect(element);
               ids.push('b' + index);

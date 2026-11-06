@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
- * dsh-web-annotator — whole-page capture benchmark (v1.7 performance work).
+ * dsh-web-annotator — capture benchmark for clustered annotations on a long page.
  *
  * Serves a deterministic fixture (40 rows ≈ 5560px tall, gradient background,
  * 40 local images, no network) through a host-like local server, drives the
- * runtime's `capture-screenshots` in `full` mode three times through headless
+ * runtime's `capture-screenshots` in `full` or `area` mode three times through headless
  * Chrome (CDP, real time — no virtual-time clock), and prints:
  *   - capture_ms (median of 3; wall time from request to `screenshots` message)
  *   - render canvas pixels/size/scale (html2canvas output)
@@ -14,6 +14,7 @@
  * A/B two runtime builds on the same fixture/machine:
  *   node test/bench.capture.mjs --label baseline --runtime path/to/runtime.js
  *   node test/bench.capture.mjs --label optimized
+ *   node test/bench.capture.mjs --mode area --annotations 3
  *
  * No third-party dependencies (Node 22+ global WebSocket for CDP).
  */
@@ -200,6 +201,13 @@ const label = labelArgIndex >= 0 ? String(process.argv[labelArgIndex + 1] || 'ru
 // Optional runtime override so the same fixture can A/B two runtime builds.
 const runtimeArgIndex = process.argv.indexOf('--runtime');
 const runtimePath = runtimeArgIndex >= 0 ? path.resolve(process.argv[runtimeArgIndex + 1]) : RUNTIME_PATH;
+const modeArgIndex = process.argv.indexOf('--mode');
+const mode = modeArgIndex >= 0 ? process.argv[modeArgIndex + 1] : 'full';
+const countArgIndex = process.argv.indexOf('--annotations');
+const annotationCount = countArgIndex >= 0 ? Number(process.argv[countArgIndex + 1]) : 12;
+if (!['full', 'area'].includes(mode) || !Number.isInteger(annotationCount) || annotationCount < 1 || annotationCount > 12) {
+  throw new Error('Expected --mode full|area and --annotations 1..12');
+}
 
 const browser = findBrowser();
 if (!browser) {
@@ -262,7 +270,7 @@ let pageWs = null;
 let benchResult = null;
 
 try {
-  const pageUrl = `${origin}/page`;
+  const pageUrl = `${origin}/page?mode=${mode}&annotations=${annotationCount}`;
   console.log(`bench page: ${pageUrl}`);
   console.log(`runtime:    ${runtimePath}`);
   console.log(`label:      ${label}`);
@@ -373,6 +381,8 @@ const pageSize = benchResult.pageSize || null;
 
 const summary = {
   label,
+  mode,
+  annotationCount,
   status: 'ok',
   page: pageSize ? `${pageSize.width}x${pageSize.height}` : 'unknown',
   pagePixels: pageSize ? pageSize.width * pageSize.height : 0,
@@ -389,7 +399,7 @@ const summary = {
 };
 
 console.log('');
-console.log(`BENCH label=${summary.label} page=${summary.page}`);
+console.log(`BENCH label=${summary.label} mode=${mode} annotations=${annotationCount} page=${summary.page}`);
 console.log(`  capture_ms (3):     ${captureTimes.join(', ')}  -> median ${summary.capture_ms_median} ms`);
 console.log(`  html2canvas ms (3): ${captures.map((entry) => entry.renderMs).join(', ')}  -> median ${summary.render_ms_median} ms`);
 if (canvas) {
