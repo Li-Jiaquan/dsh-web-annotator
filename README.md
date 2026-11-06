@@ -1,6 +1,8 @@
 # 网页批注 · DSH Web Annotator
 
-给 DeepSeek Harness Web UI 增加 Codex 风格的「网页批注」：在会话里打开一个网页预览，点选元素、框选区域或拖选文本，填写意见后一键发给当前 Agent。
+[English](README.en.md)
+
+DSH NEXT 的网页批注插件。在会话里打开网页，点选元素、框选区域或拖选文字，添加评论，再把批注和截图写入对话草稿。
 
 ## 安装（plugin_manager install_bundle）
 
@@ -10,13 +12,17 @@
 
 **安装步骤**：
 
-1. 把本目录放到任意位置（保留完整目录，含 `index.js` / `runtime.js` / `client.js` / `vendor/`），或直接使用现有路径。
+1. 克隆仓库，或下载 ZIP 后解压，保留完整目录。
+
+   ```bash
+   git clone https://github.com/Li-Jiaquan/dsh-web-annotator.git
+   ```
 2. 在 DSH 任意会话中，让 Agent 用 `plugin_manager` 工具安装本地 bundle：
 
    ```jsonc
    {
      "action": "install_bundle",
-     "target": "C:\\Users\\ljq\\DeskBox\\虚拟桌面\\新建\\dsh-web-annotator"
+     "target": "C:/Projects/dsh-web-annotator"
    }
    ```
 
@@ -28,7 +34,7 @@
 
 - 本插件目录以 `link:` 方式接入 profile，修改代码后：`client.js` 通常会热更新，`runtime.js` 每次请求现读，**`index.js`（宿主半）改动需要重启 DSH NEXT**。
 - 若入口消失（插件在 profile 里被禁用），对同一 target 执行 `plugin_manager.set_bundle`（`enabled: true`）重新启用，**不要手工编辑 profile**。
-- 卸载：对 target `@local/dsh-web-annotator` 执行 `plugin_manager.remove_bundle`，重启 DSH NEXT。
+- 卸载时用 `plugin_manager.remove_bundle`，`target` 填安装目录的绝对路径，然后重启 DSH NEXT。
 
 ## 入口（3 处）
 
