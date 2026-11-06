@@ -71,6 +71,7 @@
 
 ## 截图是如何生成的
 
+- DSH NEXT 桌面版优先直接截取隔离网页视图中已显示的画面，并保留批注的红框和编号。批注超出当前视口、网页视图缩放或原生截图失败时使用下面的局部渲染流程。
 - 运行时按需加载内置的 `html2canvas`（1.4.1，MIT），直接渲染批注附近的区域。邻近批注尽量合并，远处分块按页面顺序拼接，最多四块。每条批注的文字都会写入草稿。合成图加红框和编号后导出 PNG，长边 ≤2400px、体积 ≤3MB。
 - 加载器对真实站点做了兼容：html2canvas 是 UMD 包，**遇到定义了 AMD loader 的页面（如 baidu.com，`window.define.amd === true`）会注册成 AMD 模块而不设置 `window.html2canvas`**；因此运行时优先用 `fetch(绝对 /vendor URL)` + `new Function(...)`（把 `define/module/exports/require` 影子为 `undefined`，强制走浏览器全局分支），失败再回退 classic `<script>`。同时避免 `<base href="target">` 把相对 `/vendor/...` 解析到目标站。
 - 跨源图片通过宿主新增的 `GET /asset?url=` 同源代理取回（`html2canvas` 的 `proxy` 选项），因此截图不会因跨源图片而空白/失败；图片等待上限 4s，过慢的图片会被跳过（截图仍成功）。

@@ -397,6 +397,8 @@ check('client.js requests annotation areas and drafts one screenshot attachment'
   assertIncludes(source, 'makeCaptureRequestId', 'request id generator');
   assertIncludes(source, 'postCaptureRequest', 'capture request sender');
   assertIncludes(source, "options: { mode: 'area' }", 'explicit area capture mode (SPEC §17)');
+  assertIncludes(source, 'desktop.capture(ids, requestId)', 'desktop preview tries a native snapshot (SPEC §19)');
+  assertIncludes(source, 'else if (!postCaptureRequest(requestId, ids))', 'legacy renderer remains available when native capture yields no image');
   assertIncludes(source, "PAGE_SCREENSHOT_ID = '__page__'", 'fixed screenshot item id');
   assertIncludes(source, "PAGE_SCREENSHOT_FILE = 'screenshot-page.png'", 'fixed attachment file name');
   assertIncludes(source, 'screenshotPageFile', 'screenshot item -> File helper');

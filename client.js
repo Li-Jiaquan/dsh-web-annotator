@@ -55,6 +55,7 @@ window.__ModuleLoader__.load({
     const NOOP_INBOUND_TYPES = new Set(['marker-hover', 'marker-click']);
     /** Screenshot response deadline and the single annotated PNG. */
     const SCREENSHOT_TIMEOUT_MS = 15000;
+    const NATIVE_CAPTURE_TIMEOUT_MS = 750;
     const PAGE_SCREENSHOT_ID = '__page__';
     const PAGE_SCREENSHOT_FILE = 'screenshot-page.png';
     /** Right-sidebar page kind opened by the shortcut and the guide entry. */
@@ -447,6 +448,179 @@ window.__ModuleLoader__.load({
       }
     }
     /* dsha:screenshotPageFile-end */
+
+    /* dsha:desktopGuest-begin */
+    /** The guest has no Electron or Node API. Relay its existing page messages. */
+    function installGuestInbox(channel, allowedTypes) {
+      if (typeof window.__dshaReadGuest === 'function') return true;
+      const queue = [];
+      let waiting = null;
+      window.addEventListener('message', function (event) {
+        const data = event.data;
+        if (event.source !== window || event.origin !== location.origin || !data ||
+            data.channel !== channel || !allowedTypes.includes(data.type)) return;
+        if (waiting) {
+          const resolve = waiting;
+          waiting = null;
+          resolve(data);
+        } else if (queue.length < 32) {
+          queue.push(data);
+        }
+      });
+      window.__dshaReadGuest = function () {
+        if (queue.length) return queue.shift();
+        return new Promise(function (resolve) { waiting = resolve; });
+      };
+      return true;
+    }
+
+    function desktopBrowserBridge() {
+      const desktop = window.dshDesktop;
+      const browser = desktop && desktop.protocolVersion === 1 ? desktop.browser : null;
+      return browser && typeof browser.acquire === 'function' && typeof browser.release === 'function' ? browser : null;
+    }
+
+    /** A single isolated DSH browser guest, reused across annotator navigations. */
+    function mountDesktopGuest(container, browser, events) {
+      const guest = document.createElement('webview');
+      guest.className = 'dsha-frame';
+      guest.style.display = 'flex';
+      let reservation = null;
+      let disposed = false;
+      let attached = false;
+      let connected = false;
+      let target = '';
+      let generation = 0;
+      const attachmentTimer = setTimeout(function () {
+        events.unavailable(new Error('Desktop guest attachment timed out'));
+      }, 3000);
+
+      function current(url, revision) {
+        return !disposed && generation === revision && guest.getURL().split('#')[0] === url;
+      }
+
+      function evaluate(url, expression) {
+        return guest.executeJavaScript(
+          'location.href.split("#")[0] === ' + JSON.stringify(url) + ' ? (' + expression + ') : null',
+        );
+      }
+
+      function loadTarget() {
+        const revision = ++generation;
+        connected = false;
+        guest.loadURL(target).catch(function () {
+          if (!disposed && revision === generation) events.error();
+        });
+      }
+
+      guest.addEventListener('dom-ready', async function () {
+        if (disposed) return;
+        if (!attached) {
+          clearTimeout(attachmentTimer);
+          if (typeof guest.capturePage !== 'function') {
+            events.unavailable(new Error('Native guest capture unavailable'));
+            return;
+          }
+          attached = true;
+          loadTarget();
+          return;
+        }
+        const url = target;
+        const revision = ++generation;
+        connected = false;
+        try {
+          if (!current(url, revision)) {
+            events.error();
+            return;
+          }
+          const allowed = PAGE_TO_PARENT.filter(function (type) { return !NOOP_INBOUND_TYPES.has(type); });
+          const install = '(' + installGuestInbox.toString() + ')(' + JSON.stringify(CHANNEL) + ',' + JSON.stringify(allowed) + ')';
+          if (!await evaluate(url, install) || !current(url, revision)) return;
+          connected = true;
+          events.load();
+          while (current(url, revision)) {
+            const data = await evaluate(url, 'window.__dshaReadGuest()');
+            if (!data || !current(url, revision)) break;
+            events.message(data);
+          }
+        } catch (error) {
+          if (!disposed && revision === generation) events.unavailable(error);
+        }
+      });
+      guest.addEventListener('render-process-gone', events.unavailable);
+
+      Promise.resolve().then(function () {
+        return browser.acquire('dsh-web-annotator');
+      }).then(function (lease) {
+        reservation = lease;
+        if (disposed) return browser.release(lease.lease);
+        guest.setAttribute('name', lease.lease);
+        guest.setAttribute('partition', lease.partition);
+        guest.setAttribute('src', 'about:blank#' + lease.lease);
+        container.appendChild(guest);
+        return undefined;
+      }).catch(function (error) {
+        if (!disposed) events.unavailable(error);
+      });
+
+      return {
+        navigate(url) {
+          target = url;
+          if (attached) loadTarget();
+        },
+        post(message) {
+          if (!connected) return false;
+          const revision = generation;
+          evaluate(target, 'window.postMessage(' + JSON.stringify(message) + ', location.origin)').catch(function () {
+            if (!disposed && revision === generation) events.unavailable();
+          });
+          return true;
+        },
+        async capture(ids, requestId) {
+          if (!connected) return null;
+          const url = target;
+          const revision = generation;
+          let expired = false;
+          let timer;
+          const timeout = new Promise(function (resolve) {
+            timer = setTimeout(function () { expired = true; resolve(null); }, NATIVE_CAPTURE_TIMEOUT_MS);
+          });
+          const capture = async function () {
+            try {
+              if (guest.getZoomFactor() !== 1) return null;
+              const clip = await evaluate(url, 'window.__dshAnnotatorShot?.prepare(' + JSON.stringify(requestId) + ',' + JSON.stringify(ids) + ')');
+              if (!clip || expired || !current(url, revision)) return null;
+              const { x, y, width, height } = clip;
+              if (![x, y, width, height].every(Number.isInteger) || x < 0 || y < 0 || width < 1 || height < 1 ||
+                  x + width > guest.clientWidth || y + height > guest.clientHeight || Math.max(width, height) > 2400) return null;
+              const image = await guest.capturePage({ x, y, width, height });
+              if (expired || !current(url, revision) || image.isEmpty()) return null;
+              const dataUrl = image.toDataURL();
+              if (dataUrl.length > 'data:image/png;base64,'.length + 4 * 1024 * 1024) return null;
+              return { id: PAGE_SCREENSHOT_ID, dataUrl: dataUrl, ...image.getSize() };
+            } catch (error) {
+              return null;
+            } finally {
+              if (!disposed && revision === generation) {
+                evaluate(url, 'window.__dshAnnotatorShot?.finish(' + JSON.stringify(requestId) + ')').catch(function () {});
+              }
+            }
+          };
+          try {
+            return await Promise.race([capture(), timeout]);
+          } finally {
+            clearTimeout(timer);
+          }
+        },
+        dispose() {
+          disposed = true;
+          clearTimeout(attachmentTimer);
+          guest.remove();
+          if (reservation) Promise.resolve(browser.release(reservation.lease)).catch(function () {});
+        },
+      };
+    }
+    /* dsha:desktopGuest-end */
 
     /** The shipped `conversation` service, when this build provides it. */
     function resolveConversationService() {
@@ -859,11 +1033,15 @@ window.__ModuleLoader__.load({
       const [attachScreenshots, setAttachScreenshots] = useState(true);
       const [sending, setSending] = useState(false);
       const [captureStatus, setCaptureStatus] = useState('');
+      const [desktopDisabled, setDesktopDisabled] = useState(false);
       // v1.6 (SPEC.md §15): in-memory browser-style history + one-shot reload token.
       const [history, setHistory] = useState({ entries: [], index: -1 });
       const [reloadToken, setReloadToken] = useState(0);
 
       const iframeRef = useRef(null);
+      const desktopContainerRef = useRef(null);
+      const desktopGuestRef = useRef(null);
+      const desktopMessageRef = useRef(null);
       const endpointRef = useRef(endpoint);
       const frameReadyRef = useRef(false);
       const modeRef = useRef(false);
@@ -1087,18 +1265,13 @@ window.__ModuleLoader__.load({
         };
       }, [endpointAttempt]);
 
-      /** Post one contract message to the proxied page (targetOrigin = proxy origin). */
-      const sendToFrame = useCallback(function (type, payload) {
-        if (PARENT_TO_PAGE.indexOf(type) < 0) return false;
+      const postFrameMessage = useCallback(function (message) {
+        if (desktopGuestRef.current) return desktopGuestRef.current.post(message);
         const frame = iframeRef.current;
         const endpointNow = endpointRef.current;
         if (!frame || !endpointNow || endpointNow.origin === '') return false;
         const frameWindow = frame.contentWindow;
         if (!frameWindow) return false;
-        const message =
-          payload === undefined
-            ? { channel: CHANNEL, type: type }
-            : { channel: CHANNEL, type: type, payload: payload };
         try {
           frameWindow.postMessage(message, endpointNow.origin);
           return true;
@@ -1107,20 +1280,30 @@ window.__ModuleLoader__.load({
         }
       }, []);
 
+      /** Post one contract message to the current preview. */
+      const sendToFrame = useCallback(function (type, payload) {
+        if (PARENT_TO_PAGE.indexOf(type) < 0) return false;
+        const message = { channel: CHANNEL, type: type };
+        if (payload !== undefined) message.payload = payload;
+        return postFrameMessage(message);
+      }, [postFrameMessage]);
+
       // Inbound protocol (SPEC.md §3): only the proxied frame origin is trusted.
       useEffect(() => {
-        const handleMessage = function (event) {
+        const handleMessage = function (event, fromDesktop) {
           const data = event && event.data;
           // Fast bail-outs: unrelated window messages (and page-side-only
           // pointer feedback) never reach origin checks or React state.
           if (!data || typeof data !== 'object' || data.channel !== CHANNEL) return;
           if (!INBOUND_TYPES.has(data.type)) return;
           if (NOOP_INBOUND_TYPES.has(data.type)) return;
-          const frame = iframeRef.current;
-          const endpointNow = endpointRef.current;
-          if (!frame || !endpointNow || endpointNow.origin === '') return;
-          if (typeof event.origin === 'string' && event.origin !== endpointNow.origin) return;
-          if (event.source && event.source !== frame.contentWindow) return;
+          if (!fromDesktop) {
+            const frame = iframeRef.current;
+            const endpointNow = endpointRef.current;
+            if (!frame || !endpointNow || endpointNow.origin === '') return;
+            if (typeof event.origin === 'string' && event.origin !== endpointNow.origin) return;
+            if (event.source && event.source !== frame.contentWindow) return;
+          }
           switch (data.type) {
             case 'ready': {
               frameReadyRef.current = true;
@@ -1228,8 +1411,10 @@ window.__ModuleLoader__.load({
               break;
           }
         };
+        desktopMessageRef.current = function (data) { handleMessage({ data: data }, true); };
         window.addEventListener('message', handleMessage);
         return function () {
+          desktopMessageRef.current = null;
           window.removeEventListener('message', handleMessage);
         };
       }, [sendToFrame, t]);
@@ -1339,6 +1524,27 @@ window.__ModuleLoader__.load({
         },
         [t],
       );
+
+      const desktopBrowser = desktopDisabled ? null : desktopBrowserBridge();
+      useEffect(function () {
+        const container = desktopContainerRef.current;
+        if (!desktopBrowser || !container) return;
+        const preview = mountDesktopGuest(container, desktopBrowser, {
+          load: handleFrameLoad,
+          error: handleFrameError,
+          unavailable: function () { setDesktopDisabled(true); },
+          message: function (data) { desktopMessageRef.current?.(data); },
+        });
+        desktopGuestRef.current = preview;
+        return function () {
+          desktopGuestRef.current = null;
+          preview.dispose();
+        };
+      }, [desktopBrowser, frameLoaded, handleFrameLoad, handleFrameError]);
+
+      useEffect(function () {
+        if (frameSrc !== '') desktopGuestRef.current?.navigate(frameSrc);
+      }, [frameSrc, frameNonce, desktopBrowser, handleFrameLoad, handleFrameError]);
 
       const clearFeedback = function () {
         setActionError('');
@@ -1522,26 +1728,13 @@ window.__ModuleLoader__.load({
 
       /** Request screenshots around the annotations (SPEC §17). */
       function postCaptureRequest(requestId, ids) {
-        const frame = iframeRef.current;
-        const endpointNow = endpointRef.current;
-        if (!frame || !endpointNow || endpointNow.origin === '') return false;
-        const frameWindow = frame.contentWindow;
-        if (!frameWindow) return false;
-        try {
-          frameWindow.postMessage(
-            {
-              channel: CHANNEL,
-              type: 'capture-screenshots',
-              requestId: requestId,
-              ids: ids,
-              options: { mode: 'area' },
-            },
-            endpointNow.origin,
-          );
-          return true;
-        } catch (error) {
-          return false;
-        }
+        return postFrameMessage({
+          channel: CHANNEL,
+          type: 'capture-screenshots',
+          requestId: requestId,
+          ids: ids,
+          options: { mode: 'area' },
+        });
       }
 
       const handleSend = function () {
@@ -1564,25 +1757,21 @@ window.__ModuleLoader__.load({
         sendingRef.current = true;
         setSending(true);
         setCaptureStatus('capturing');
-        const started = postCaptureRequest(
-          requestId,
-          list.map(function (annotation) {
-            return annotation.id;
-          }),
-        );
-        if (!started) {
-          sendingRef.current = false;
-          setSending(false);
-          setCaptureStatus('captureFailed');
-          writeDraftPrompt(list, null, true);
-          return;
-        }
+        const ids = list.map(function (annotation) { return annotation.id; });
         const pending = { requestId: requestId, annotations: list, timer: 0 };
         pendingCaptureRef.current = pending;
         pending.timer = setTimeout(function () {
           const complete = finishCaptureRef.current;
           if (typeof complete === 'function') complete(requestId, null, true);
         }, SCREENSHOT_TIMEOUT_MS);
+        const handleSnapshot = function (item) {
+          if (pendingCaptureRef.current !== pending) return;
+          if (item) finishCaptureRef.current?.(requestId, { items: [item] }, false);
+          else if (!postCaptureRequest(requestId, ids)) finishCaptureRef.current?.(requestId, null, true);
+        };
+        const desktop = desktopGuestRef.current;
+        if (desktop) desktop.capture(ids, requestId).then(handleSnapshot, function () { handleSnapshot(null); });
+        else handleSnapshot(null);
       };
 
       const handleToggleScreenshots = function () {
@@ -1855,15 +2044,17 @@ window.__ModuleLoader__.load({
             'div',
             { className: 'dsha-stage' },
             frameSrc !== ''
-              ? h('iframe', {
-                  key: 'frame-' + frameNonce,
-                  ref: iframeRef,
-                  className: 'dsha-frame',
-                  src: frameSrc,
-                  title: t('view.label'),
-                  onLoad: handleFrameLoad,
-                  onError: handleFrameError,
-                })
+              ? desktopBrowser
+                ? h('div', { ref: desktopContainerRef, className: 'dsha-frame' })
+                : h('iframe', {
+                    key: 'frame-' + frameNonce,
+                    ref: iframeRef,
+                    className: 'dsha-frame',
+                    src: frameSrc,
+                    title: t('view.label'),
+                    onLoad: handleFrameLoad,
+                    onError: handleFrameError,
+                  })
               : h('div', { className: 'dsha-placeholder' }, placeholderText),
           ),
         ),

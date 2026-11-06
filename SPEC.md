@@ -577,3 +577,9 @@ Lead `test/accept.mjs` 增加：`/vendor/html2canvas.min.js` 200 且长度 > 100
 §16.1 的 `/site/` 响应默认 `no-store`。未重定向的 200 脚本、样式、图片、字体或 WebAssembly 在上游显式设置 `public, max-age=...` 且仍有剩余有效期时，可在当前浏览器私有缓存中复用。有效期扣除上游 `Age` 和 `Date` 反映的资源年龄。带 Cookie、要求每次重新验证或按非编码请求头变化的响应继续使用 `no-store`。
 
 `/proxy` 顶层页面、嵌套 HTML、动态 API 和开发服务器的 `no-cache` 资源仍每次请求。刷新按钮沿用 §15.3，重新获取顶层页面，浏览器可复用仍有效的静态资源。
+
+## 19. DSH NEXT 原生批注截图
+
+- 桌面客户端通过 `dshDesktop.browser` 的租约使用隔离的 Electron 网页视图。视图仍访问同一个 `/proxy`，继续使用 §3 和 §17 的消息字段。普通浏览器和无法创建桌面视图的环境使用 iframe。
+- 当所有批注都在当前视口内，桌面客户端调用页面运行时的 `__dshAnnotatorShot.prepare(requestId, ids)`，短暂隐藏原批注控件，在对应位置绘制截图专用红框和编号。渲染后返回视口内的裁剪矩形。客户端对网页视图调用 `capturePage`，取得当前画面。运行时由 `finish(requestId)` 或清理计时器恢复原批注控件。
+- 视口外的批注、缩放后的视图或原生截图不可用时，使用 §17 的局部渲染。两条路径都按现有草稿流程附带一张 `screenshot-page.png`。原生截图仅从隔离的网页视图取像素。

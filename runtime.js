@@ -2351,6 +2351,75 @@
 
   var h2cPromise = null;
   var captureChain = Promise.resolve();
+  var desktopShot = null;
+
+  /** Prepare the guest compositor for one viewport snapshot (SPEC §19). */
+  async function prepareDesktopShot(requestId, rawIds) {
+    if (!root || !shadow || desktopShot || typeof requestId !== 'string' || requestId.length > 200) return null;
+    var visual = window.visualViewport;
+    if (visual && (visual.scale !== 1 || visual.offsetLeft !== 0 || visual.offsetTop !== 0)) return null;
+    var ids = sanitizeCaptureIds(rawIds);
+    if (ids.length === 0) return null;
+    var sx = scrollLeft();
+    var sy = scrollTop();
+    var vw = document.documentElement.clientWidth;
+    var vh = document.documentElement.clientHeight;
+    var left = vw;
+    var top = vh;
+    var right = 0;
+    var bottom = 0;
+    var marks = [];
+    for (var id of ids) {
+      var annotation = findAnnotation(id);
+      if (!annotation) return null;
+      var rect = annotation.rect;
+      var x = rect.x - sx;
+      var y = rect.y - sy;
+      if (rect.width < 1 || rect.height < 1 || x < 0 || y < 0 || x + rect.width > vw || y + rect.height > vh) return null;
+      left = Math.min(left, x);
+      top = Math.min(top, y);
+      right = Math.max(right, x + rect.width);
+      bottom = Math.max(bottom, y + rect.height);
+      marks.push(annotation);
+    }
+    left = Math.floor(Math.max(0, left - AREA_CONTEXT));
+    top = Math.floor(Math.max(0, top - AREA_CONTEXT));
+    right = Math.ceil(Math.min(vw, right + AREA_CONTEXT));
+    bottom = Math.ceil(Math.min(vh, bottom + AREA_CONTEXT));
+    var clip = { x: left, y: top, width: right - left, height: bottom - top };
+    if (Math.max(clip.width, clip.height) * (window.devicePixelRatio || 1) > FULL_MAX_LONG_EDGE) return null;
+
+    var canvas = document.createElement('canvas');
+    canvas.width = clip.width;
+    canvas.height = clip.height;
+    if (!drawScreenshotMarks(canvas, marks, 1, 1, { left: left + sx, top: top + sy })) return null;
+    canvas.style.cssText = 'position:absolute;pointer-events:none;visibility:visible;left:' + left + 'px;top:' + top + 'px;';
+    var shot = {
+      requestId: requestId,
+      canvas: canvas,
+      visibility: root.style.visibility,
+      timer: setTimeout(function () { finishDesktopShot(requestId); }, 1200)
+    };
+    desktopShot = shot;
+    root.style.visibility = 'hidden';
+    shadow.appendChild(canvas);
+    // Let the compositor present the marked layer before capturePage reads it.
+    await new Promise(function (resolve) {
+      requestAnimationFrame(function () { requestAnimationFrame(resolve); });
+    });
+    if (desktopShot === shot && sx === scrollLeft() && sy === scrollTop()) return clip;
+    if (desktopShot === shot) finishDesktopShot(requestId);
+    return null;
+  }
+
+  function finishDesktopShot(requestId) {
+    if (!desktopShot || desktopShot.requestId !== requestId) return;
+    clearTimeout(desktopShot.timer);
+    root.style.visibility = desktopShot.visibility;
+    desktopShot.canvas.remove();
+    releaseCanvas(desktopShot.canvas);
+    desktopShot = null;
+  }
 
   /**
    * Lazily load /vendor/html2canvas.min.js. The vendor is a UMD bundle: on a page
@@ -3173,6 +3242,9 @@
       ensureRoot();
       installPageListeners();
       applyMode(false, false);
+      if (window.parent === window) {
+        window.__dshAnnotatorShot = { prepare: prepareDesktopShot, finish: finishDesktopShot };
+      }
       postReady();
     } catch (error) {
       reportError(error);
