@@ -851,7 +851,7 @@ export function createAnnotatorServer(options = {}) {
         response.status,
         {
           'content-type': contentTypeHeader || 'application/octet-stream',
-          'cache-control': 'no-store',
+          'cache-control': mirrorCacheControl(response, contentType),
         },
         body,
       );
@@ -1656,6 +1656,33 @@ function formatByteLimit(limitBytes) {
   if (limitBytes >= 1024 * 1024) return `${Math.round(limitBytes / (1024 * 1024))}MB`;
   if (limitBytes >= 1024) return `${Math.round(limitBytes / 1024)}KB`;
   return `${limitBytes}B`;
+}
+
+/** Give Chrome only the remaining public freshness of eligible static assets. */
+function mirrorCacheControl(response, contentType) {
+  const noStore = 'no-store';
+  const mime = contentType.split(';', 1)[0].trim();
+  const staticAsset = /^(?:text\/(?:css|javascript|ecmascript)|application\/(?:javascript|ecmascript|wasm)|(?:font|image)\/[\w.+-]+)$/;
+  if (response.status !== 200 || response.redirected || !staticAsset.test(mime)) return noStore;
+
+  const headers = response.headers;
+  if (typeof headers?.get !== 'function' || headers.get('set-cookie')) return noStore;
+  const vary = (headers.get('vary') || '').trim().toLowerCase();
+  if (vary && vary !== 'accept-encoding') return noStore;
+
+  const directives = (headers.get('cache-control') || '').toLowerCase().split(',').map((part) => part.trim());
+  const supportedDirective = /^(?:public|immutable|must-revalidate|(?:max-age|s-maxage|stale-while-revalidate|stale-if-error)=\d+)$/;
+  if (!directives.includes('public') || !directives.every((part) => supportedDirective.test(part))) return noStore;
+  const maxAges = directives.filter((part) => part.startsWith('max-age='));
+  if (maxAges.length !== 1) return noStore;
+
+  const maxAge = Number(maxAges[0].slice('max-age='.length));
+  if (!Number.isSafeInteger(maxAge)) return noStore;
+  const apparentAge = Math.ceil((Date.now() - Date.parse(headers.get('date'))) / 1000) || 0;
+  const remaining = Math.floor(maxAge - Math.max(0, Number(headers.get('age') ?? 0), apparentAge));
+  if (remaining <= 0 || !Number.isFinite(remaining)) return noStore;
+
+  return `private, max-age=${remaining}, must-revalidate${directives.includes('immutable') ? ', immutable' : ''}`;
 }
 
 /**

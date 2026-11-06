@@ -1133,6 +1133,45 @@ test('proxy server: v1.8 /site/ mirror and mirror-based /proxy injection', async
 
 // ---------------------------------------------------------------- v1.7 (performance)
 
+test('mirror allows private browser caching only for explicitly public static responses', async (t) => {
+  const fresh = 'public, max-age=120';
+  const cases = [
+    { type: 'text/javascript; charset=utf-8', policy: fresh + ', immutable', headers: { Age: '30', Vary: 'Accept-Encoding' }, expected: 'private, max-age=90, must-revalidate, immutable' },
+    { type: 'text/css', policy: fresh + ', stale-while-revalidate=60', expected: 'private, max-age=120, must-revalidate' },
+    { type: 'font/woff2', policy: fresh, expected: 'private, max-age=120, must-revalidate' },
+    { type: 'image/png', policy: fresh, headers: { Age: '120' } },
+    { type: 'image/png', policy: fresh, headers: { Date: 'Wed, 01 Jan 2020 00:00:00 GMT' } },
+    { type: 'text/javascript', policy: 'no-cache' },
+    { type: 'text/javascript', policy: fresh + ', no-cache="Set-Cookie"' },
+    { type: 'text/css', policy: fresh + ', no-store' },
+    { type: 'image/png', policy: 'private, max-age=120' },
+    { type: 'image/png', policy: fresh + ', max-age=300' },
+    { type: 'image/png', policy: fresh, headers: { 'Set-Cookie': 'session=test' } },
+    { type: 'image/png', policy: fresh, headers: { Vary: 'Accept-Encoding, Cookie' } },
+    { type: 'text/html', policy: fresh },
+    { type: 'application/json', policy: fresh },
+    { type: 'text/javascript', policy: fresh, status: 404 },
+  ];
+  const proxy = createAnnotatorServer({
+    fetchImpl(url) {
+      const item = cases[Number(new URL(url).pathname.slice(1))];
+      return new Response('body {}', {
+        status: item.status || 200,
+        headers: { 'content-type': item.type, 'cache-control': item.policy, ...item.headers },
+      });
+    },
+  });
+  const { origin } = await proxy.start();
+  t.after(() => proxy.close());
+
+  for (const [index, item] of cases.entries()) {
+    const response = await getText(`${origin}/site/http/example.test/${index}`);
+    assert.equal(response.cache, item.expected || 'no-store', JSON.stringify(item));
+    assert.equal(response.status, item.status || 200);
+    assert.equal(response.text, 'body {}');
+  }
+});
+
 test('proxy server: v1.7 asset LRU cache, cache headers and runtime ETag/304', async (t) => {
   const baseHandler = createTargetHandler();
   const upstreamHits = new Map();

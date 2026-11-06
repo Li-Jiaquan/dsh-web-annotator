@@ -98,6 +98,7 @@ v1.7 做了一轮性能优化，全部可复现（`node test/bench.capture.mjs`�
 - `/asset` 增加 LRU 内存缓存（64 条 / 24MB / TTL 120s，仅缓存 200 且 ≤4MB 的响应）：同一批跨源图片在重复截图时直接命中，单张命中耗时约 **13.1ms → 5.4ms（2.4–2.9×）**，上游请求次数 **2 → 1**。
 - `/vendor/html2canvas.min.js` 返回 `Cache-Control: public, max-age=31536000, immutable`，重复打开页面不再重复下载/解析 198KB 资源。
 - `/runtime.js` 返回 `Cache-Control: no-cache` + 强 `ETag`，命中返回 **304 空体**；文件读取按 mtime+size 缓存，steady 请求约 **3.5ms → 2.8ms**。
+- `/site/` 允许浏览器复用上游明确允许缓存且仍有效的静态资源。重新打开页面时仍会获取最新 HTML，开发服务器的 `no-cache` 脚本也会重新获取。
 - `/proxy` 路径未改（50 次平均约 2.5ms），无回归。
 
 **客户端（client）**
@@ -120,7 +121,7 @@ v1.7 做了一轮性能优化，全部可复现（`node test/bench.capture.mjs`�
 
 ```
 node --check index.js client.js runtime.js
-node test/host.test.mjs          # 13/13 宿主代理、/site 同源镜像、endpoint、/vendor、/asset（含缓存/ETag）、协议回退
+node test/host.test.mjs          # 宿主代理、/site 同源镜像与缓存、endpoint、/vendor、/asset、协议回退
 node test/client.static.mjs      # 23/23 客户端外壳/槽注册/协议/模板/草稿写入/截图/地址栏/导航/浏览器历史/渲染性能
 node test/runtime-check.mjs      # 73/73 运行时契约 + headless Chrome 端到端手势
 node test/runtime.screenshot.mjs # 局部与旧版截图模式、navigate/ready-url、镜像 base 目标 URL 推导

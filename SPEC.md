@@ -533,7 +533,7 @@ Lead `test/accept.mjs` 增加：`/vendor/html2canvas.min.js` 200 且长度 > 100
 ### 16.1 宿主新路由 `/site/`（index.js）
 - `GET/HEAD /site/<scheme>/<hostport>/<path...>[?query]`：
   - `scheme` ∈ {http,https}；`hostport` = 主机[:端口]（IPv6 用 `[::1]`）；`path` 可为空（等价 `/`）；query 原样转发到目标 URL。
-  - 语义与 `/proxy` 的资源获取一致：15s 超时、20MB 上限、跟随重定向（用最终响应 URL 相对路径时以上游最终 URL 为准，简单实现：直接返回最终字节）、错误码 502/504/400 与 `/proxy` 一致；`Cache-Control: no-store`；非 GET/HEAD → 405。
+  - 语义与 `/proxy` 的资源获取一致：15s 超时、20MB 上限、跟随重定向（用最终响应 URL 相对路径时以上游最终 URL 为准，简单实现：直接返回最终字节）、错误码 502/504/400 与 `/proxy` 一致；默认 `Cache-Control: no-store`，静态资源例外见 §18；非 GET/HEAD → 405。
   - 响应头保留上游 `Content-Type`（缺失时 `application/octet-stream`）；仅透传安全头（content-type/content-length/缓存不转发）。
   - **CSS 响应**（`text/css`）：把代码里的绝对路径 `url(/...)`、`url("/...")`、`@import "/..."` 重写为 `/site/<scheme>/<hostport>/...`（`//host` 协议相对也重写；`data:`/`http(s):` 绝对 URL 不改）。
   - **HTML 响应**（`text/html`，嵌套文档）：把 `src|href|poster|action|formaction` 以单个 `/` 开头的属性值重写为 `/site/<scheme>/<hostport>/...`；`srcset` 同理（逐项）。
@@ -571,3 +571,9 @@ Lead `test/accept.mjs` 增加：`/vendor/html2canvas.min.js` 200 且长度 > 100
 - 分散的区域分别渲染，最多保留四块，按页面顺序拼成一张图。超出块数的批注记入 `failed`，文本照常写入。渲染器按区域设置 `x`、`y`、`width`、`height`，并在克隆文档里跳过范围外的子树绘制，以保留原页面布局。范围内跨源图像沿用 `/asset`。
 - 复用 §12.2 的红框、编号、`__page__` 响应 id 和 PNG 大小上限。编号与草稿内的批注序号一致。客户端继续添加一张 `screenshot-page.png`，提示词引用 `prompt.screenshotAreas`。无可用截图或超时按 §13.2 写入文本。
 - 验收覆盖真实宿主代理下的邻近批注合并、滚动后远处批注的像素和标记、跳过无关跨源图，以及旧截图模式。
+
+## 18. 镜像静态资源的浏览器缓存
+
+§16.1 的 `/site/` 响应默认 `no-store`。未重定向的 200 脚本、样式、图片、字体或 WebAssembly 在上游显式设置 `public, max-age=...` 且仍有剩余有效期时，可在当前浏览器私有缓存中复用。有效期扣除上游 `Age` 和 `Date` 反映的资源年龄。带 Cookie、要求每次重新验证或按非编码请求头变化的响应继续使用 `no-store`。
+
+`/proxy` 顶层页面、嵌套 HTML、动态 API 和开发服务器的 `no-cache` 资源仍每次请求。刷新按钮沿用 §15.3，重新获取顶层页面，浏览器可复用仍有效的静态资源。
