@@ -1,10 +1,22 @@
 {
-  "name": "@local/dsh-web-annotator",
+  "name": "dsh-web-annotator",
   "version": "0.1.0",
-  "private": true,
   "license": "MIT",
   "type": "module",
   "description": "In-app web page annotation for DSH: annotate elements, areas and text in a proxied web page preview, then send structured comments to the agent.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Li-Jiaquan/dsh-web-annotator.git"
+  },
+  "homepage": "https://github.com/Li-Jiaquan/dsh-web-annotator#readme",
+  "bugs": {
+    "url": "https://github.com/Li-Jiaquan/dsh-web-annotator/issues"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh-plugin",
+    "web-annotation"
+  ],
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
@@ -22,7 +34,9 @@
     "vendor/*",
     "icon.svg",
     "LICENSE",
-    "README.md"
+    "README.md",
+    "README.en.md",
+    "demo"
   ],
   "dsh": {
     "manifestVersion": 1,

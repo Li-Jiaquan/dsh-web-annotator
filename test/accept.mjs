@@ -48,7 +48,7 @@ async function getText(url) {
 // ---------------------------------------------------------------- manifest
 await check('package.json is valid and declares the bundle + client', () => {
   const pkg = JSON.parse(read('package.json'));
-  assert(pkg.name === '@local/dsh-web-annotator', 'name');
+  assert(pkg.name === 'dsh-web-annotator', 'name');
   assert(pkg.type === 'module', 'type module');
   assert(pkg.dsh && pkg.dsh.bundle && pkg.dsh.bundle.patch === './cordis.patch.yml', 'dsh.bundle.patch');
   assert(pkg.dsh.client && pkg.dsh.client.platform === 'web', 'dsh.client.platform');
@@ -65,7 +65,7 @@ await check('cordis.patch.yml inserts exactly one web-annotator row', () => {
   const yaml = read('cordis.patch.yml');
   assert(/- insert:/.test(yaml), 'has insert');
   assert(/id:\s*web-annotator/.test(yaml), 'row id web-annotator');
-  assert(/name:\s*'@local\/dsh-web-annotator'/.test(yaml), 'row package name');
+  assert(/name:\s*dsh-web-annotator/.test(yaml), 'row package name');
   return 'ok';
 });
 
@@ -119,7 +119,7 @@ await check('runtime.js exposes the injected root and the frozen message vocabul
 await check('client.js keeps the module-loader shape and registers the conversation view', () => {
   const client = read('client.js');
   assert(client.includes('__ModuleLoader__.load'), 'module loader');
-  assert(client.includes('@local/dsh-web-annotator'), 'package id');
+  assert(client.includes('dsh-web-annotator'), 'package id');
   assert(client.includes('conversation.view'), 'slot name');
   assert(client.includes("id: 'web-annotator'") || client.includes('id: "web-annotator"'), 'view id');
   assert(client.includes('inputActions.setDraft'), 'setDraft');

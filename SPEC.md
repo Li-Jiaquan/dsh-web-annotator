@@ -168,7 +168,7 @@ anchor 结构（`select.payload`，字段冻结，缺失用 null）：
 
 ```js
 window.__ModuleLoader__.load({
-  id: '@local/dsh-web-annotator',
+  id: 'dsh-web-annotator',
   factory(require) {
     const React = require('react');
     const h = React.createElement;
@@ -294,7 +294,7 @@ DOM 路径: {elementPath}
   - 用本机 Chrome/Edge headless 加载 `test/runtime.test.html`（内含 `<script src="../runtime.js"></script>`），`--dump-dom` 后断言出现 `dsh-web-annotator-root`；
   - 可选：用 `--virtual-time-budget=2000`；找不到浏览器时打印明确 SKIP 并退出 0。
 - client-view：`node test/client.static.mjs`
-  - `node --check client.js` 通过；文件包含 `__ModuleLoader__.load`、`id: '@local/dsh-web-annotator'`、`conversation.view`、`inputActions.setDraft`、`inputActions.submit`、`buildPrompt`、`# 网页批注`；
+  - `node --check client.js` 通过；文件包含 `__ModuleLoader__.load`、`id: 'dsh-web-annotator'`、`conversation.view`、`inputActions.setDraft`、`inputActions.submit`、`buildPrompt`、`# 网页批注`；
   - 不包含 `@deepseek-ai/dsh-client-ui-` 的 import/require、不包含 `document.body.appendChild`。
 - Lead 验收：`node test/accept.mjs`（Lead 写）。
 

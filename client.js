@@ -13,7 +13,7 @@
  * no client UI package imports, no third-party dependencies.
  */
 window.__ModuleLoader__.load({
-  id: '@local/dsh-web-annotator',
+  id: 'dsh-web-annotator',
   factory(require) {
     const React = require('react');
     const h = React.createElement;
@@ -61,7 +61,7 @@ window.__ModuleLoader__.load({
     /** Right-sidebar page kind opened by the shortcut and the guide entry. */
     const TAB_KIND = 'web-annotator';
     /** Tab-type identity: also the dispatch key of the two keyed sidebar seats. */
-    const TAB_ID = '@local/dsh-web-annotator/tab';
+    const TAB_ID = 'dsh-web-annotator/tab';
     /** Optional services the right-sidebar surfaces need; absent ones disable only those surfaces. */
     const SIDEBAR_SERVICES = ['sidebarRight', 'sidebarRightTabs', 'layout'];
     /** The built-in Browser persists each tab's checkpoint under this key prefix. */

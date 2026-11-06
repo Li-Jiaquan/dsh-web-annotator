@@ -56,7 +56,7 @@ check('node --check client.js', () => {
 // ------------------------------------------------- module shell and plugin
 check('client.js keeps the module-loader shell and plugin contract', () => {
   assertIncludes(source, '__ModuleLoader__.load', 'module loader');
-  assertIncludes(source, "id: '@local/dsh-web-annotator'", 'package id');
+  assertIncludes(source, "id: 'dsh-web-annotator'", 'package id');
   assertIncludes(source, 'factory(require)', 'factory signature');
   assertIncludes(source, "require('react')", 'react require');
   assertIncludes(source, 'const h = React.createElement', 'createElement alias');
@@ -79,7 +79,7 @@ check('client.js registers the conversation view with the frozen options', () =>
 
 check('client.js registers the optional right-sidebar surfaces and diagnostics', () => {
   assertIncludes(source, "const TAB_KIND = 'web-annotator'", 'sidebar tab kind');
-  assertIncludes(source, "const TAB_ID = '@local/dsh-web-annotator/tab'", 'sidebar tab type id');
+  assertIncludes(source, "const TAB_ID = 'dsh-web-annotator/tab'", 'sidebar tab type id');
   assertIncludes(
     source,
     "const SIDEBAR_SERVICES = ['sidebarRight', 'sidebarRightTabs', 'layout']",
@@ -860,7 +860,7 @@ check('factory + apply smoke test with a stub React and Cordis context', () => {
     console: sandboxConsole,
   };
   vm.runInNewContext(source, sandbox, { filename: 'client.js' });
-  assert(loaded && loaded.id === '@local/dsh-web-annotator', 'module-loader registration');
+  assert(loaded && loaded.id === 'dsh-web-annotator', 'module-loader registration');
   // A tiny render stub: function components execute, fragments flatten, and
   // hook results are fixed values good enough for one render pass.
   const stateInits = [];
@@ -993,7 +993,7 @@ check('factory + apply smoke test with a stub React and Cordis context', () => {
   );
   assert(sidebarTabTypes.length === 1, 'one sidebar tab type registered');
   const tabType = sidebarTabTypes[0];
-  assert(tabType.id === '@local/dsh-web-annotator/tab', 'sidebar type id');
+  assert(tabType.id === 'dsh-web-annotator/tab', 'sidebar type id');
   assert(tabType.kind === 'web-annotator', 'sidebar type kind');
   assert(tabType.multiple === false, 'single tab instance');
   assert(typeof tabType.title === 'function' && tabType.title() === 'T(tab.title)', 'localized tab title');
