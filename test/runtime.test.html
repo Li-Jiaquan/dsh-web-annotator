@@ -488,13 +488,13 @@
             'count=' + host.getAttribute('data-dsh-markers')
           );
 
-          // 10. clear -> markers gone, mode off
-          var clearPending = waitForMessage('mode', 1500, function (payload) {
-            return payload && payload.active === false;
+          // Clear markers without changing the selected mode.
+          var activeBeforeClear = waitForMessage('mode', 1500, function (payload) {
+            return payload && payload.active === true;
           });
+          window.postMessage({ channel: 'dsh-web-annotator', type: 'set-mode', payload: { active: true } }, '*');
+          if (!await activeBeforeClear) throw new Error('no mode:true ack before clear');
           window.postMessage({ channel: 'dsh-web-annotator', type: 'clear' }, '*');
-          var cleared = await clearPending;
-          assert('clear-mode', !!cleared, 'no mode:false ack');
           await wait(20);
           set('markers-after-clear-value', host.getAttribute('data-dsh-markers') || '');
           assert(
@@ -502,7 +502,9 @@
             host.getAttribute('data-dsh-markers') === '0',
             'count=' + host.getAttribute('data-dsh-markers')
           );
-          assert('mode-after-clear', host.getAttribute('data-dsh-mode') === '0', 'mode=' + host.getAttribute('data-dsh-mode'));
+          assert('mode-after-clear', host.getAttribute('data-dsh-mode') === '1', 'mode=' + host.getAttribute('data-dsh-mode'));
+
+          window.postMessage({ channel: 'dsh-web-annotator', type: 'set-mode', payload: { active: false } }, '*');
 
           // 11. markers stay interactive outside annotation mode (they are our own 22px UI)
           window.postMessage(

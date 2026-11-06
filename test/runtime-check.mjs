@@ -242,9 +242,9 @@ check('runtime posted ready', (attrOf(html, 'data-test-ready') || '') === '1');
 check('parent hello produced a second ready', (seen.match(/ready/g) || []).length >= 1, `seen=${seen}`);
 check('set-mode produced a mode ack (active)', (attrOf(html, 'data-test-mode-ack-active') || '') === '1');
 check('set-annotations rendered 2 markers', (attrOf(html, 'data-test-markers-after-set') || '') === '1');
-check('clear produced a mode ack (inactive)', (attrOf(html, 'data-test-mode-ack-inactive') || '') === '1');
+check('explicit mode toggle produced an inactive ack', (attrOf(html, 'data-test-mode-ack-inactive') || '') === '1');
 check('clear removed all markers', (attrOf(html, 'data-test-markers-after-clear') || '') === '1');
-check('clear exited annotation mode', (attrOf(html, 'data-test-mode-after-clear') || '') === '1');
+check('clear preserved annotation mode', (attrOf(html, 'data-test-mode-after-clear') || '') === '1');
 check('no runtime errors were reported', (attrOf(html, 'data-test-no-runtime-errors') || '') === '1');
 
 // Selection anchors
@@ -297,7 +297,7 @@ check('set-annotations([]) clears markers', (attrOf(html, 'data-test-markers-cle
 
 // Final overlay state reflected in the host attributes
 check('host data-dsh-markers="0" after clear', /data-dsh-markers="0"/.test(html));
-check('host data-dsh-mode="0" after clear', /data-dsh-mode="0"/.test(html));
+check('host data-dsh-mode="0" after explicit mode off', /data-dsh-mode="0"/.test(html));
 
 /* ====================================================================== *
  * summary

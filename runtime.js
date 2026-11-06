@@ -1484,7 +1484,7 @@
       }
       state.flashTimer = 0;
     }
-    applyMode(false, true);
+    resetInteraction();
   }
 
   /* ================================================================== *

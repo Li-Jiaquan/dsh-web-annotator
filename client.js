@@ -1015,6 +1015,7 @@ window.__ModuleLoader__.load({
       const openView = p.openView;
       const sessionId = typeof p.sessionId === 'string' ? p.sessionId : '';
       const variant = p.variant === 'sidebar' ? 'sidebar' : 'view';
+      const modeKey = sessionId ? 'dsha.annotation-mode.' + variant + '.' + sessionId : '';
       const incomingUrl = typeof p.initialUrl === 'string' ? p.initialUrl : '';
 
       const [endpoint, setEndpoint] = useState({ phase: 'loading', origin: '', status: 0, message: '' });
@@ -1026,7 +1027,13 @@ window.__ModuleLoader__.load({
       const [pageLoading, setPageLoading] = useState(false);
       const [frameNonce, setFrameNonce] = useState(0);
       const [frameReady, setFrameReady] = useState(false);
-      const [mode, setMode] = useState(false);
+      const [mode, setMode] = useState(function () {
+        try {
+          return modeKey !== '' && window.sessionStorage.getItem(modeKey) === '1';
+        } catch {
+          return false;
+        }
+      });
       const [annotations, setAnnotations] = useState([]);
       const [actionError, setActionError] = useState('');
       const [notice, setNotice] = useState('');
@@ -1044,7 +1051,7 @@ window.__ModuleLoader__.load({
       const desktopMessageRef = useRef(null);
       const endpointRef = useRef(endpoint);
       const frameReadyRef = useRef(false);
-      const modeRef = useRef(false);
+      const modeRef = useRef(mode);
       const annotationsRef = useRef(annotations);
       const pendingCaptureRef = useRef(null);
       const finishCaptureRef = useRef(null);
@@ -1101,8 +1108,6 @@ window.__ModuleLoader__.load({
           return nonce + 1;
         });
         commitAnnotations([]);
-        modeRef.current = false;
-        setMode(false);
         sendToFrame('clear');
       }
 
@@ -1331,12 +1336,9 @@ window.__ModuleLoader__.load({
               navigateToTarget(navigateUrl);
               break;
             }
-            case 'mode': {
-              const active = !!(data.payload && data.payload.active);
-              modeRef.current = active;
-              setMode(active);
+            case 'mode':
+            case 'escape':
               break;
-            }
             case 'select': {
               const anchor = normalizeAnchor(data.payload);
               if (!anchor) {
@@ -1386,11 +1388,6 @@ window.__ModuleLoader__.load({
               if (typeof submit === 'function') submit();
               break;
             }
-            case 'escape': {
-              modeRef.current = false;
-              setMode(false);
-              break;
-            }
             case 'screenshots': {
               // Response to `capture-screenshots`; SPEC.md §10.3 keeps
               // requestId/items/failed at the message's top level.
@@ -1418,12 +1415,6 @@ window.__ModuleLoader__.load({
           window.removeEventListener('message', handleMessage);
         };
       }, [sendToFrame, t]);
-
-      // Push the current tool state down whenever it changes (and on ready).
-      useEffect(() => {
-        modeRef.current = mode;
-        if (frameReady) sendToFrame('set-mode', { active: mode });
-      }, [mode, frameReady, sendToFrame]);
 
       // Marker signature drives the marker-push effect; memoized so typing in
       // the address bar / status changes do not rebuild it every render.
@@ -1678,8 +1669,6 @@ window.__ModuleLoader__.load({
         }
         // SPEC.md §13.2: reset the page/mirror after a successful write.
         commitAnnotations([]);
-        modeRef.current = false;
-        setMode(false);
         sendingRef.current = false;
         setSending(false);
         sendToFrame('clear');
@@ -1812,9 +1801,14 @@ window.__ModuleLoader__.load({
           return;
         }
         setActionError('');
-        const next = !mode;
+        const next = !modeRef.current;
         modeRef.current = next;
         setMode(next);
+        try {
+          if (modeKey) window.sessionStorage.setItem(modeKey, next ? '1' : '0');
+        } catch {
+          /* The current view still keeps the user's selection. */
+        }
         sendToFrame('set-mode', { active: next });
       };
 
@@ -1822,8 +1816,6 @@ window.__ModuleLoader__.load({
         clearFeedback();
         cancelPendingCapture();
         commitAnnotations([]);
-        modeRef.current = false;
-        setMode(false);
         sendToFrame('clear');
       };
 

@@ -171,7 +171,6 @@ check('client.js syncs mode and annotation markers on ready and on change', () =
     "sendToFrame('set-annotations', { annotations: markersOf(annotationsRef.current) })",
     'ready re-sends annotations',
   );
-  assertIncludes(source, "sendToFrame('set-mode', { active: mode })", 'mode change sync');
   assertIncludes(source, "sendToFrame('set-annotations', { annotations: markersOf(annotations) })", 'annotation sync');
   assertIncludes(source, "sendToFrame('hello')", 'hello on iframe load');
   // v1.2 removes the right-side list, whose row click used to send focus-annotation.
@@ -252,7 +251,8 @@ check('client.js implements v1.6 back/forward/reload history', () => {
   assert(loadBlock.includes('cancelPendingCapture()'), 'load cancels in-flight captures');
   assert(loadBlock.includes('commitAnnotations([])'), 'load clears the annotation mirror');
   assert(loadBlock.includes("sendToFrame('clear')"), 'load clears the page annotations');
-  assert(loadBlock.includes('setMode(false)'), 'load exits annotation mode');
+  assert(!loadBlock.includes('setMode('), 'load preserves annotation mode');
+  assert((source.match(/\bsetMode\(/g) || []).length === 1, 'only the toolbar changes annotation mode');
   assert(loadBlock.includes('setPageLoading(true)'), 'load enters the page-loading state');
   assert(loadBlock.includes('setUrlInput(href)'), 'load updates the address bar');
   // Reload must not touch the history stack/index (SPEC §15.3).
